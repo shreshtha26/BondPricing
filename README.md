@@ -1,10 +1,12 @@
 # Derivatives Fixed-Income Analytics
 
-This project is a first-version fixed-income analytics engine. It loads live US
-Treasury market data from FRED, bootstraps a zero curve, calculates discount
-factors and forward rates, prices a date-aware fixed-coupon bond, and writes
-CSV/HTML reports. It also includes optional industry-style builders for actual
-Treasury bill/note/bond prices and SOFR/OIS quotes.
+This is an early version of a fixed-income analytics project built in Python.
+The project currently focuses on US Treasury market data. It pulls Treasury yield data from FRED, builds a zero curve, 
+calculates discount factors and forward rates, and prices a fixed-coupon bond using proper date and cashflow handling.
+
+It also generates basic reports so the results can be reviewed easily.
+The project includes some additional experimental modules for working with Treasury bill/note/bond prices 
+and SOFR/OIS-style curve inputs.
 
 ## What It Does
 
@@ -181,17 +183,4 @@ Provide either `tenor_months` or `maturity_date`.
 ## Current Limitations
 
 This is an industry-style first version, not a production trading system.
-Important remaining items include:
 
-- vendor data feeds for actual Treasury prices and OIS quotes
-- exchange/vendor-certified calendars including early closes and emergency
-  closures
-- swap curve construction
-- credit curves
-- callable bond models
-
-## Recommended Next Step
-
-The next technical step is to add formal tests and then feed the new
-instrument-level builders with real Treasury and OIS quote files from a market
-data vendor.

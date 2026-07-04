@@ -1,4 +1,4 @@
-# Derivatives Fixed-Income Analytics
+# Bond Pricing Analytics
 
 This is an early version of a fixed-income analytics project built in Python.
 The project currently focuses on US Treasury market data. It pulls Treasury yield data from FRED, builds a zero curve, 

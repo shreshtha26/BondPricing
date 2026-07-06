@@ -97,6 +97,34 @@ poetry run python main.py --ois-quotes-csv data/ois_quotes.csv --sofr-rate 5.25
 
 If `--sofr-rate` is omitted, the workflow tries to load SOFR from FRED for `--sofr-date` or the settlement date.
 
+## Sample Output
+
+The sample validation run writes `outputs/bond_quote_validation_report.csv`. A passing run looks like this:
+
+| security_id | price_type | market_price | model_price | residual | accrued_interest | status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| SAMPLEFIXED1 | clean | 100.10 | 100.1009 | 0.0009 | 1.5295 | PASS_TOLERANCE |
+| SAMPLEZERO1 | dirty | 85.73 | 85.7275 | -0.0025 | 4.7100 | PASS_TOLERANCE |
+
+The residual is:
+
+```text
+model_price - market_price
+```
+
+A positive residual means the model price is above the observed quote. A negative residual means the model price is below the observed quote.
+
+## Interpreting Residuals
+
+The first version explains a residual through the fields it can observe directly:
+
+- `clean_price`, `dirty_price`, and `accrued_interest` show whether the difference is coming from quote convention or settlement accrual.
+- `price_type` shows whether the market quote was compared on a clean or dirty basis.
+- `quote_source`, `bid`, `ask`, and `tolerance` show whether the quote is a point estimate, a range, or a tolerance-based validation.
+- The curve report and calibration report show whether the selected Treasury curve is internally consistent with the bootstrapped zero curve.
+
+Large residuals are not automatically errors. They may come from curve choice, stale quotes, missing credit spread, liquidity premium, tax treatment, embedded optionality, or security terms that do not match the supplied CSV.
+
 ## Outputs
 
 Generated files are written to `outputs/`:
@@ -188,6 +216,20 @@ The main gaps are:
 - TRACE, EMMA, Bloomberg, broker-run, and evaluated-price data must be supplied as files for now.
 - Callable, puttable, floating-rate, inflation-linked, credit-risky, option, swap, and securitized-product logic are planned layers, not the first completed workflow.
 - Data-quality diagnostics are basic: quote source, currency, bid/ask, tolerance, and model-vs-market residual.
+
+## Roadmap
+
+The build order is deliberately layered:
+
+1. Fixed-coupon and zero-coupon bond quote validation.
+2. Yield, spread, Z-spread, and DV01 diagnostics.
+3. Floating-rate note pricing.
+4. Inflation-linked bond pricing.
+5. Callable and puttable bond logic.
+6. Credit-risky bond pricing.
+7. OIS, swaps, and multi-curve rate workflows.
+8. Caps, floors, swaptions, and other fixed-income options.
+9. Securitized-product cashflows, prepayment, and waterfall logic.
 
 ## Tests
 

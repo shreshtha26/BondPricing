@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Compact fixed-income valuation and quote-validation engine."
 authors = ["Shreshtha Chakraborty"]
 readme = "README.md"
+license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.12"

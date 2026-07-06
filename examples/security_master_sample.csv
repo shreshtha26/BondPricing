@@ -1,0 +1,3 @@
+security_id,id_type,issuer,instrument_type,issue_date,maturity_date,coupon_rate,face_value,frequency,currency,issue_price,day_count,discount_day_count,business_day_convention,date_generation_rule,end_of_month
+SAMPLEFIXED1,SAMPLE,Demo issuer,fixed_coupon_bond,2022-02-15,2032-02-15,4.25,100,2,USD,,ACT/ACT ICMA,ACT/365F,UNADJUSTED,BACKWARD,false
+SAMPLEZERO1,SAMPLE,Demo issuer,zero_coupon_bond,2023-01-15,2028-01-15,,100,2,USD,82.50,ACT/ACT ICMA,ACT/365F,UNADJUSTED,BACKWARD,false

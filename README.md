@@ -1,96 +1,116 @@
-# Bond Pricing Analytics
+# BondPricing
 
-This is an early version of a fixed-income analytics project built in Python.
-The project currently focuses on US Treasury market data. It pulls Treasury yield data from FRED, builds a zero curve, 
-calculates discount factors and forward rates, and prices a fixed-coupon bond using proper date and cashflow handling.
+BondPricing is a compact fixed-income valuation and quote-validation engine.
 
-It also generates basic reports so the results can be reviewed easily.
-The project includes some additional experimental modules for working with Treasury bill/note/bond prices 
-and SOFR/OIS-style curve inputs.
+The first workflow answers one practical question:
 
-## What It Does
+> Given bond terms, an observed quote, and a selected curve, what is the model price, what is the residual, and what explains it?
 
-The main workflow is:
+The current build is focused on fixed-coupon and zero-coupon bonds. It loads a Treasury curve, bootstraps discount factors and zero rates, prices supplied bond records, and compares model clean/dirty prices with observed quotes.
+
+The project is intentionally written for explanation. A result should be traceable from:
+
+```text
+market data -> curve -> cashflows -> accrued interest -> price -> risk -> residual
+```
+
+## Current Workflow
 
 ```text
 FRED Treasury CMT data
   -> Treasury par-style yield snapshot
   -> par-yield bootstrap
-  -> discount factors
-  -> zero / spot curve
-  -> forward rates
-  -> bond pricing and risk
-  -> CSV reports and interactive chart
+  -> discount factors and zero rates
+  -> calibration report
+  -> optional fixed/zero bond quote validation from CSV
 ```
 
-In this project, `spot rate` and `zero rate` mean the same thing.
-
-The additional curve paths are:
+Optional curve paths are also available:
 
 ```text
-Treasury bill/note/bond market prices
-  -> clean/dirty price conversion
+Treasury bill/note/bond quotes
+  -> clean/dirty conversion
   -> instrument cashflows
-  -> price-based Treasury bootstrap
-  -> Treasury zero curve
+  -> price-based Treasury zero curve
 
-SOFR overnight fixing + OIS par fixed rates
+SOFR fixing + OIS par rates
   -> OIS fixed-leg schedules
-  -> OIS discount-factor bootstrap
-  -> collateralized SOFR/OIS zero curve
+  -> SOFR/OIS discount curve
 ```
 
-## How To Run
+In this repo, `spot rate` and `zero rate` mean the same thing.
 
-Run the full live workflow:
+## Quick Start
+
+Install dependencies with Poetry:
 
 ```bash
-python main.py
+poetry install
 ```
 
-Useful options:
+Build the Treasury CMT-based zero curve:
 
 ```bash
-python main.py --date 2026-06-25
-python main.py --refresh-cache
-python main.py --output-dir outputs
-python main.py --coupon-rate 0.0475
-python main.py --issue-date 2024-02-15 --maturity-date 2034-02-15
+poetry run python main.py
 ```
 
-Run optional instrument-level Treasury bootstrapping:
+Run a specific curve date:
 
 ```bash
-python main.py --treasury-instruments-csv path/to/treasury_quotes.csv
+poetry run python main.py --date 2024-06-25
 ```
 
-Run optional SOFR/OIS bootstrapping:
+Run the fixed/zero bond validation path using explicit sample CSV files:
 
 ```bash
-python main.py --ois-quotes-csv path/to/ois_quotes.csv --sofr-rate 5.25
+poetry run python main.py \
+  --date 2024-06-25 \
+  --security-master-csv examples/security_master_sample.csv \
+  --bond-quotes-csv examples/bond_quotes_sample.csv
 ```
 
-If `--sofr-rate` is omitted, the workflow tries to load the SOFR fixing from
-FRED for `--sofr-date` or the settlement date.
+Those sample files are not hidden defaults. They are ordinary input files that exercise the same ingestion path used for real broker, vendor, TRACE-style, or internally prepared data.
+
+## Real Data Inputs
+
+For quote validation, provide both files:
+
+```bash
+poetry run python main.py \
+  --security-master-csv data/security_master.csv \
+  --bond-quotes-csv data/bond_quotes.csv
+```
+
+The engine does not create a default bond inside `main.py`. Bond terms and observed prices must come from files you supply.
+
+Optional Treasury instrument bootstrapping:
+
+```bash
+poetry run python main.py --treasury-instruments-csv data/treasury_quotes.csv
+```
+
+Optional SOFR/OIS bootstrapping:
+
+```bash
+poetry run python main.py --ois-quotes-csv data/ois_quotes.csv --sofr-rate 5.25
+```
+
+If `--sofr-rate` is omitted, the workflow tries to load SOFR from FRED for `--sofr-date` or the settlement date.
 
 ## Outputs
 
-The workflow writes generated files into `outputs/`:
+Generated files are written to `outputs/`:
 
 ```text
-outputs/curve_plot.html
-outputs/curve_report.csv
-outputs/bond_report.csv
-outputs/bond_cashflows.csv
-outputs/calibration_report.csv
-outputs/key_rate_dv01_report.csv
-outputs/price_reconciliation_report.csv
-outputs/treasury_instrument_curve_report.csv
-outputs/sofr_ois_curve_report.csv
-outputs/run.log
+curve_report.csv
+calibration_report.csv
+bond_quote_validation_report.csv
+treasury_instrument_curve_report.csv
+sofr_ois_curve_report.csv
+run.log
 ```
 
-FRED CSV files are cached in:
+FRED downloads are cached in:
 
 ```text
 data/fred_cache/
@@ -98,57 +118,45 @@ data/fred_cache/
 
 ## Main Files
 
-- `int_rate_convention.py`: day counts, business-day rolling, schedules,
-  compounding, discount factors, present value helpers.
-- `market_calendar.py`: reusable market calendars, settlement-date helpers,
-  and CSV-loaded holiday overlays for vendor or firm-maintained exceptions.
-- `market_data_loader.py`: live FRED loading, local caching, Treasury curve
-  snapshots, provenance, live chart creation.
-- `bootstrapping.py`: par-yield bootstrap into discount factors and zero rates,
-  plus interactive chart rendering.
-- `yield_curve.py`: `ZeroCurve`, interpolation, discount factors, forward rates,
-  implied par yields, cashflow pricing, curve bumps.
-- `bond_pricing.py`: simple and date-aware fixed-coupon bond pricing, accrued
-  interest, clean/dirty prices, duration, convexity, DV01.
-- `risk_analytics.py`: key-rate DV01 and curve shock risk reports.
-- `validation_reports.py`: calibration report rows and clean/dirty/accrued
-  reconciliation checks.
-- `treasury_instruments.py`: Treasury bill/note/bond instrument objects with
-  bill price conversion, accrued interest, dirty price, and future cashflows.
-- `treasury_curve_builder.py`: instrument-level Treasury bootstrapping from
-  actual bill prices/discount yields and note/bond clean prices.
-- `sofr_ois.py`: SOFR fixing loading, OIS quote loading, and SOFR/OIS curve
-  bootstrapping.
-- `main.py`: command-line workflow that ties everything together.
-- `MODEL_ASSUMPTIONS.md`: model assumptions, calibration logic, risk
-  definitions, and known limitations.
-- `tests/`: unit tests for parsing, calibration, key-rate DV01, and price
-  reconciliation.
+- `main.py`: command-line workflow for curve building and quote validation.
+- `pricing.py`: fixed-coupon and zero-coupon pricing types plus the compact `price(...)` API.
+- `curves.py`: zero curves, discount factors, forwards, par-yield bootstrapping, and root solving.
+- `conventions.py`: day counts, business-day rolling, schedules, and discount factors.
+- `market_data.py`: FRED loading, CSV loaders, market-data containers, and curve metadata.
+- `analytics.py`: calibration rows, quote-validation rows, risk rows, valuation snapshots, and P&L explain.
+- `treasury.py`: price-based Treasury bootstrapping from bill/note/bond CSV inputs.
+- `rates.py`: SOFR fixing loading, OIS quote loading, and SOFR/OIS curve bootstrapping.
+- `backtesting/`: historical valuation and P&L explain helpers.
+- `tests/`: deterministic tests using synthetic fixtures.
 
-## Tests
+## CSV Schemas
 
-Run the unit tests:
+Security master:
 
-```bash
-python -m unittest discover
+```text
+security_id,id_type,issuer,instrument_type,issue_date,maturity_date,coupon_rate,face_value,frequency,currency,issue_price,day_count,discount_day_count,business_day_convention,date_generation_rule,end_of_month
+SAMPLEFIXED1,SAMPLE,Demo issuer,fixed_coupon_bond,2022-02-15,2032-02-15,4.25,100,2,USD,,ACT/ACT ICMA,ACT/365F,UNADJUSTED,BACKWARD,false
+SAMPLEZERO1,SAMPLE,Demo issuer,zero_coupon_bond,2023-01-15,2028-01-15,,100,2,USD,82.50,ACT/ACT ICMA,ACT/365F,UNADJUSTED,BACKWARD,false
 ```
 
-## CSV Input Schemas
+Bond quotes:
 
-Treasury instrument CSV:
+```text
+security_id,valuation_date,clean_price,dirty_price,bid,ask,quote_source,price_type,currency
+SAMPLEFIXED1,2024-06-25,100.10,,,,SAMPLE_FILE,clean,USD
+SAMPLEZERO1,2024-06-25,,85.73,,,SAMPLE_FILE,dirty,USD
+```
+
+Treasury instrument quotes:
 
 ```text
 instrument_type,issue_date,maturity_date,price,discount_yield,coupon_rate,clean_price,face_value,frequency
-BILL,2026-05-28,2026-07-28,99.70,,,,100,
-NOTE,2024-08-15,2028-08-15,,,0.040,99.20,100,2
-BOND,2024-02-15,2036-02-15,,,0.045,99.10,100,2
+BILL,2024-05-28,2024-07-25,99.70,,,,100,
+NOTE,2022-08-15,2028-08-15,,,4.00,99.20,100,2
+BOND,2020-02-15,2034-02-15,,,4.50,99.10,100,2
 ```
 
-For bills, provide either `price` or `discount_yield`. For notes and bonds,
-provide `coupon_rate` and `clean_price`. Rates can be decimals such as `0.045`
-or percentages such as `4.5`.
-
-OIS quote CSV:
+OIS quotes:
 
 ```text
 tenor_months,maturity_date,fixed_rate,fixed_leg_frequency,fixed_leg_day_count
@@ -157,30 +165,34 @@ tenor_months,maturity_date,fixed_rate,fixed_leg_frequency,fixed_leg_day_count
 24,,0.0375,1,ACT/360
 ```
 
-Provide either `tenor_months` or `maturity_date`.
+Rates can be supplied as decimals such as `0.045` or percentages such as `4.5`.
 
 ## Financial Assumptions
 
 - FRED Treasury CMT rates are treated as Treasury par-style yields.
-- The bootstrapped zero curve uses continuously compounded zero rates.
-- The bootstrap uses linear interpolation on zero rates.
-- Endpoint extrapolation is only used where code explicitly opts into it.
-- The default live chart is based on fitted FRED CMT yields. Instrument-level
-  Treasury bootstrapping is available when actual bill/note/bond quotes are
-  supplied by CSV.
-- Treasury notes and bonds are bootstrapped from dirty price, where dirty price
-  equals quoted clean price plus accrued interest.
-- The SOFR/OIS curve uses the par OIS equation
-  `fixed_rate * fixed_leg_annuity = 1 - final_discount_factor`.
-- Key-rate DV01 bumps one zero-curve node at a time and reprices the bond with
-  a central difference.
-- The calibration report compares market par yields with par yields implied by
-  the bootstrapped curve.
-- The price reconciliation report checks `dirty price = clean price + accrued`.
-- Holiday calendars include rule-based US government securities/New York bank
-  full-day holidays and support CSV overlays for vendor-maintained exceptions.
+- The CMT workflow bootstraps continuously compounded zero rates.
+- Curve interpolation is linear on zero rates.
+- Endpoint extrapolation is only used where the code explicitly opts into it.
+- Fixed-coupon bonds use generated coupon schedules, accrued interest, clean price, and dirty price.
+- Zero-coupon bonds discount principal and, when `issue_price` is supplied, report simple constant-yield accretion as accrued interest.
+- The quote-validation report compares supplied observed clean/dirty prices with model clean/dirty prices.
+- Holiday calendars are compact rule-based US government securities/New York bank calendars, not vendor-certified calendars.
 
-## Current Limitations
+## Current Limits
 
-This is an industry-style first version, not a production trading system.
+This is a desk-style approximation engine, not an audit-grade valuation library.
 
+The main gaps are:
+
+- No licensed CUSIP/ISIN terms feed is included.
+- TRACE, EMMA, Bloomberg, broker-run, and evaluated-price data must be supplied as files for now.
+- Callable, puttable, floating-rate, inflation-linked, credit-risky, option, swap, and securitized-product logic are planned layers, not the first completed workflow.
+- Data-quality diagnostics are basic: quote source, currency, bid/ask, tolerance, and model-vs-market residual.
+
+## Tests
+
+Run the test suite:
+
+```bash
+poetry run python -m unittest discover -s tests
+```

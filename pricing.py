@@ -1,18 +1,15 @@
 """
-Bond pricing utilities built on top of the zero-curve engine.
-This module shows how the bootstrapped curve becomes useful for instruments.
-It supports simple year-fraction examples for learning and date-aware fixed
-coupon bonds for a more realistic workflow with accrued interest, clean/dirty
-prices, and curve DV01.
+Compact pricing API, pricing types, and bond pricing engines.
 """
 
 import math
-from dataclasses import dataclass
-from datetime import date
-from scipy.optimize import brentq
-from int_rate_convention import (BASIS_POINT, BusinessDayConvention, CompoundingConvention, DayCountConvention, DateGenerationRule,
-                                 discount_factor_from_rate, generate_coupon_schedule, validate_compounding_frequency, validate_discrete_rate, validate_rate, year_fraction)
-from yield_curve import ZeroCurve, coupon_accrual_periods, coupon_payment_times
+from dataclasses import dataclass, field
+from datetime import date, datetime
+
+from config import CurveConfig, ModelConfig, PricingConfig
+from conventions import (BASIS_POINT, BusinessDayConvention, CompoundingConvention, DayCountConvention, DateGenerationRule,
+                         discount_factor_from_rate, generate_coupon_schedule, validate_compounding_frequency, validate_discrete_rate, validate_rate, year_fraction)
+from curves import ZeroCurve, coupon_accrual_periods, coupon_payment_times, solve_with_expanding_bracket
 
 
 def _validate_positive(value: float, name: str) -> None:
@@ -69,167 +66,24 @@ def clean_price_from_dirty(dirty_price: float, accrued: float) -> float:
     return dirty_price - accrued
 
 
-@dataclass
-class FixedCouponBond:
+def simple_fixed_coupon_cashflow_schedule(face_value: float, coupon_rate: float, maturity_years: float,
+                                          frequency: int = 2) -> list[tuple[float, float]]:
     """
-    Year-fraction fixed-coupon bond used for compact analytics examples.
-    This class is intentionally simpler than DateAwareFixedCouponBond. It keeps
-    the early learning path easy: specify maturity in years, generate cashflows,
-    solve YTM, and compare flat-yield pricing with curve-based pricing.
+    Builds a year-fraction cashflow schedule for compact examples.
+    Date-aware production-style pricing uses DateAwareFixedCouponBond; this
+    helper keeps the small educational wrappers without a second bond class.
     """
-    face_value: float
-    coupon_rate: float
-    maturity_years: float
-    yield_rate: float | None = None
-    frequency: int = 2
-
-    def __post_init__(self) -> None:
-        """
-        Validates the simple bond inputs before any analytics are run.
-        The pricing formulas assume positive face value/maturity and a valid
-        discrete yield, so this prevents invalid examples from propagating.
-        """
-        _validate_positive(self.face_value, "face_value")
-        _validate_positive(self.maturity_years, "maturity_years")
-        validate_compounding_frequency(self.frequency)
-        validate_rate(self.coupon_rate, "coupon_rate")
-        if self.coupon_rate < 0:
-            raise ValueError("coupon_rate cannot be negative.")
-        if self.yield_rate is not None:
-            validate_discrete_rate(self.yield_rate, self.frequency)
-
-    def periods(self) -> int:
-        """
-        Returns the number of coupon periods in the simplified schedule.
-        This is mainly a convenience method for examples and reporting.
-        """
-        return len(self.cashflow_times())
-
-    def cashflow_times(self) -> list[float]:
-        """
-        Returns coupon payment times measured in years from today.
-        These times are the bridge between the simple bond object and ZeroCurve,
-        which discounts cashflows by year-fraction maturity.
-        """
-        return coupon_payment_times(maturity=self.maturity_years, frequency=self.frequency)
-
-    def coupon_per_period(self) -> float:
-        """
-        Returns the regular coupon amount for a non-stub period.
-        It is kept for readability in simple examples; cashflows() uses accrual
-        periods so stubs remain consistent with the curve code.
-        """
-        return self.face_value * self.coupon_rate / self.frequency
-
-    def yield_per_period(self) -> float:
-        """
-        Converts the annual quoted YTM into a per-period yield.
-        Flat-yield analytics use this to discount every cashflow by the same
-        yield, which contrasts with curve pricing where each date has its own
-        discount factor.
-        """
-        if self.yield_rate is None:
-            raise ValueError("yield_rate is required for yield-based analytics.")
-        return self.yield_rate / self.frequency
-
-    def cashflows(self) -> list[float]:
-        """
-        Generates coupon and principal cashflows for the simplified bond.
-        This turns bond terms into the cashflow vector that both flat-yield and
-        curve-based pricing consume.
-        """
-        accrual_periods = coupon_accrual_periods(maturity=self.maturity_years, frequency=self.frequency)
-        flows = [self.face_value * self.coupon_rate * accrual_period for accrual_period in accrual_periods]
-        flows[-1] += self.face_value
-        return flows
-
-    def cashflow_schedule(self) -> list[tuple[float, float]]:
-        """
-        Pairs each cashflow amount with its payment time in years.
-        The schedule is the common input shape for ZeroCurve.price_cashflows().
-        """
-        return list(zip(self.cashflow_times(), self.cashflows()))
-
-    def price(self) -> float:
-        """
-        Prices the bond from its flat quoted yield using discrete compounding.
-        This reproduces traditional YTM pricing, where one yield discounts all
-        cashflows. It is useful for comparison with the more realistic
-        curve-based method.
-        """
-        if self.yield_rate is None:
-            raise ValueError("yield_rate is required for yield-based pricing.")
-        validate_discrete_rate(self.yield_rate, self.frequency)
-        base = 1 + self.yield_rate / self.frequency
-        return sum(cashflow / (base ** (self.frequency * payment_time)) for payment_time, cashflow in self.cashflow_schedule())
-
-    def price_from_curve(self, curve: ZeroCurve) -> float:
-        """
-        Prices the bond by discounting each cashflow on a zero curve.
-        This is the simplified example of the project's main valuation idea:
-        once a zero curve exists, each cashflow receives its own market-implied
-        discount factor.
-        """
-        return curve.price_cashflows(self.cashflow_schedule())
-
-    def macaulay_duration(self) -> float:
-        """
-        Calculates Macaulay duration under the flat-yield assumption.
-        Duration summarizes the weighted-average timing of cashflows and is the
-        foundation for first-order interest-rate risk intuition.
-        """
-        price = self.price()
-        if price <= 0:
-            raise ValueError("Price must be positive to calculate duration.")
-        y = self.yield_per_period()
-        weighted_time = sum(payment_time * cashflow / ((1 + y) ** (self.frequency * payment_time)) for payment_time, cashflow in self.cashflow_schedule())
-        return weighted_time / price
-
-    def modified_duration(self) -> float:
-        """
-        Calculates modified duration from Macaulay duration.
-        Modified duration links a small yield move to approximate price change,
-        making it the flat-yield counterpart to DV01.
-        """
-        return self.macaulay_duration() / (1 + self.yield_per_period())
-
-    def convexity(self) -> float:
-        """
-        Calculates flat-yield convexity.
-        Convexity captures the curvature missed by duration and explains why
-        bond price changes are not perfectly linear in yield changes.
-        """
-        price = self.price()
-        if price <= 0:
-            raise ValueError("Price must be positive to calculate convexity.")
-        base = 1 + self.yield_per_period()
-        convexity_sum = 0.0
-        for payment_time, cashflow in self.cashflow_schedule():
-            periods_to_payment = self.frequency * payment_time
-            convexity_sum += cashflow * periods_to_payment * (periods_to_payment + 1) / (self.frequency ** 2) / (base ** (periods_to_payment + 2))
-        return convexity_sum / price
-
-    def dv01(self) -> float:
-        """
-        Approximate price gain for a 1 bp decrease in the flat yield.
-        DV01 is the practical risk number used to describe how much money a
-        bond gains or loses for a one-basis-point rate move.
-        """
-        return self.modified_duration() * self.price() * BASIS_POINT
-
-    def curve_dv01(self, curve: ZeroCurve, bump_size: float = BASIS_POINT) -> float:
-        """
-        Central-difference DV01 from a parallel zero-curve bump.
-        This connects the bond to the bootstrapped curve: instead of bumping a
-        single YTM, it bumps every zero rate and reprices cashflows from the
-        shifted curve.
-        """
-        validate_rate(bump_size, "bump_size")
-        if bump_size <= 0:
-            raise ValueError("bump_size must be positive.")
-        price_down = self.price_from_curve(curve.bumped(-bump_size))
-        price_up = self.price_from_curve(curve.bumped(bump_size))
-        return (price_down - price_up) / 2
+    _validate_positive(face_value, "face_value")
+    _validate_positive(maturity_years, "maturity_years")
+    validate_compounding_frequency(frequency)
+    validate_rate(coupon_rate, "coupon_rate")
+    if coupon_rate < 0:
+        raise ValueError("coupon_rate cannot be negative.")
+    payment_times = coupon_payment_times(maturity=maturity_years, frequency=frequency)
+    accrual_periods = coupon_accrual_periods(maturity=maturity_years, frequency=frequency)
+    cashflows = [face_value * coupon_rate * accrual_period for accrual_period in accrual_periods]
+    cashflows[-1] += face_value
+    return list(zip(payment_times, cashflows))
 
 
 @dataclass
@@ -380,10 +234,13 @@ class DateAwareFixedCouponBond:
 def price_from_yield(face_value: float, coupon_rate: float, maturity_years: float, yield_rate: float, frequency: int = 2) -> float:
     """
     Convenience wrapper for flat-YTM pricing of a simple fixed-coupon bond.
-    Scripts can call this without manually constructing FixedCouponBond.
+    This is kept as a compact educational wrapper; date-aware pricing should use
+    DateAwareFixedCouponBond or price(...).
     """
-    bond = FixedCouponBond(face_value=face_value, coupon_rate=coupon_rate, maturity_years=maturity_years, yield_rate=yield_rate, frequency=frequency)
-    return bond.price()
+    validate_discrete_rate(yield_rate, frequency)
+    base = 1 + yield_rate / frequency
+    return sum(cashflow / (base ** (frequency * payment_time))
+               for payment_time, cashflow in simple_fixed_coupon_cashflow_schedule(face_value, coupon_rate, maturity_years, frequency))
 
 
 def price_from_zero_curve(face_value: float, coupon_rate: float, maturity_years: float, curve: ZeroCurve, frequency: int = 2) -> float:
@@ -392,8 +249,7 @@ def price_from_zero_curve(face_value: float, coupon_rate: float, maturity_years:
     This keeps the project examples concise when demonstrating curve-based
     pricing.
     """
-    bond = FixedCouponBond(face_value=face_value, coupon_rate=coupon_rate, maturity_years=maturity_years, frequency=frequency)
-    return bond.price_from_curve(curve)
+    return curve.price_cashflows(simple_fixed_coupon_cashflow_schedule(face_value, coupon_rate, maturity_years, frequency))
 
 
 def solve_ytm(market_price: float, face_value: float, coupon_rate: float, maturity_years: float, frequency: int = 2) -> float:
@@ -407,37 +263,184 @@ def solve_ytm(market_price: float, face_value: float, coupon_rate: float, maturi
     def objective(yield_guess: float) -> float:
         theoretical_price = price_from_yield(face_value=face_value, coupon_rate=coupon_rate, maturity_years=maturity_years, yield_rate=yield_guess, frequency=frequency)
         return theoretical_price - market_price
-    lower = -frequency + 1e-10
-    upper = 0.25
-    lower_value = objective(lower)
-    upper_value = objective(upper)
-    while lower_value * upper_value > 0:
-        upper *= 2
-        if upper > 10:
-            raise ValueError("Could not bracket a yield-to-maturity solution.")
-        upper_value = objective(upper)
-    return brentq(objective, lower, upper)
+    return solve_with_expanding_bracket(objective, lower=-frequency + 1e-10, upper=0.25, max_abs_bound=10.0,
+                                        failure_message="Could not bracket a yield-to-maturity solution.",
+                                        expand_lower=False, expand_upper=True)
 
 
-if __name__ == "__main__":
-    bond = FixedCouponBond(face_value=100, coupon_rate=0.05, maturity_years=5, yield_rate=0.045, frequency=2)
-    print("Fixed Coupon Bond Example")
-    print("-" * 35)
-    print(f"Face Value:          {bond.face_value}")
-    print(f"Coupon Rate:         {bond.coupon_rate:.2%}")
-    print(f"Yield Rate:          {bond.yield_rate:.2%}")
-    print(f"Maturity:            {bond.maturity_years} years")
-    print(f"Coupon Frequency:    {bond.frequency} times per year")
-    print()
-    print("Cashflow schedule:")
-    print(bond.cashflow_schedule())
-    print()
-    print(f"Bond Price:          {bond.price():.4f}")
-    print(f"Macaulay Duration:   {bond.macaulay_duration():.4f} years")
-    print(f"Modified Duration:   {bond.modified_duration():.4f}")
-    print(f"Convexity:           {bond.convexity():.4f}")
-    print(f"DV01:                {bond.dv01():.6f}")
-    print()
-    market_price = 102
-    implied_ytm = solve_ytm(market_price=market_price, face_value=100, coupon_rate=0.05, maturity_years=5, frequency=2)
-    print(f"If market price is {market_price}, implied YTM is: {implied_ytm:.4%}")
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """
+    Bond terms needed by the first pricing workflow.
+
+    Later layers can add callable, floating-rate, inflation-linked, credit, and
+    securitized fields without changing the public price(...) shape.
+    """
+    instrument_id: str
+    instrument_type: str
+    face_value: float
+    issue_date: date
+    maturity_date: date
+    coupon_rate: float | None = None
+    frequency: int = 2
+    currency: str = "USD"
+    issue_price: float | None = None
+    day_count: DayCountConvention | str = DayCountConvention.ACT_ACT_ICMA
+    discount_day_count: DayCountConvention | str = DayCountConvention.ACT_365_FIXED
+    business_day_convention: BusinessDayConvention | str = BusinessDayConvention.UNADJUSTED
+    date_generation_rule: DateGenerationRule | str = DateGenerationRule.BACKWARD
+    end_of_month: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.instrument_id.strip():
+            raise ValueError("instrument_id is required.")
+        if not self.instrument_type.strip():
+            raise ValueError("instrument_type is required.")
+        if not math.isfinite(self.face_value) or self.face_value <= 0:
+            raise ValueError("face_value must be positive and finite.")
+        if self.issue_date >= self.maturity_date:
+            raise ValueError("issue_date must be before maturity_date.")
+        if self.coupon_rate is not None and not math.isfinite(self.coupon_rate):
+            raise ValueError("coupon_rate must be finite when provided.")
+        if self.coupon_rate is not None and self.coupon_rate < 0:
+            raise ValueError("coupon_rate cannot be negative.")
+        if self.frequency <= 0:
+            raise ValueError("frequency must be positive.")
+        if not self.currency.strip():
+            raise ValueError("currency is required.")
+        if self.issue_price is not None and (not math.isfinite(self.issue_price) or self.issue_price <= 0):
+            raise ValueError("issue_price must be positive and finite when provided.")
+        object.__setattr__(self, "currency", self.currency.upper())
+
+
+@dataclass(frozen=True)
+class MarketState:
+    """
+    Market inputs available at one valuation date.
+
+    The first engine requires a discount curve. Projection curves, spread
+    curves, volatility surfaces, repo curves, and richer quote metadata can be
+    attached as later product layers.
+    """
+    valuation_date: date
+    discount_curve: ZeroCurve
+    curve_date: date | None = None
+    quote_source: str = "unknown"
+    quote_timestamp: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.quote_source.strip():
+            raise ValueError("quote_source is required.")
+
+
+
+@dataclass(frozen=True)
+class PricingContext:
+    """
+    Curve, pricing, and model settings for one valuation run.
+
+    Feature switches live here so price(...) can stay compact as the engine
+    grows.
+    """
+    curve: CurveConfig = field(default_factory=CurveConfig)
+    pricing: PricingConfig = field(default_factory=PricingConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+
+
+@dataclass(frozen=True)
+class PricingResult:
+    """
+    Standard pricing output returned by price(...).
+
+    Diagnostics hold the curve, model, spread, adjustment, and data-quality
+    details needed to explain a residual.
+    """
+    instrument_id: str
+    valuation_date: date
+    clean_price: float
+    dirty_price: float
+    accrued_interest: float
+    currency: str = "USD"
+    diagnostics: dict[str, float | str | bool | None] = field(default_factory=dict)
+
+
+def run_pricing_pipeline(instrument: InstrumentSpec, market: MarketState, context: PricingContext) -> PricingResult:
+    if instrument.instrument_type == "fixed_coupon_bond":
+        return _price_fixed_coupon_bond(instrument=instrument, market=market, context=context)
+    if instrument.instrument_type == "zero_coupon_bond":
+        return _price_zero_coupon_bond(instrument=instrument, market=market, context=context)
+    raise NotImplementedError(f"Unsupported instrument type: {instrument.instrument_type}, pricing is not implemented yet")
+
+
+def _price_fixed_coupon_bond(instrument: InstrumentSpec, market: MarketState, context: PricingContext) -> PricingResult:
+    if instrument.coupon_rate is None:
+        raise ValueError("coupon_rate is required for fixed_coupon_bond.")
+
+    bond = DateAwareFixedCouponBond(
+        face_value=instrument.face_value,
+        coupon_rate=instrument.coupon_rate,
+        issue_date=instrument.issue_date,
+        maturity_date=instrument.maturity_date,
+        settlement_date=market.valuation_date,
+        frequency=instrument.frequency,
+        day_count=instrument.day_count,
+        discount_day_count=instrument.discount_day_count,
+        business_day_convention=instrument.business_day_convention,
+        date_generation_rule=instrument.date_generation_rule,
+        end_of_month=instrument.end_of_month)
+
+    dirty_price = bond.dirty_price_from_curve(market.discount_curve)
+    accrued_interest = bond.accrued_interest()
+    clean_price = dirty_price - accrued_interest
+
+    return PricingResult(
+        instrument_id=instrument.instrument_id,
+        valuation_date=market.valuation_date,
+        clean_price=clean_price,
+        dirty_price=dirty_price,
+        accrued_interest=accrued_interest,
+        currency=instrument.currency,
+        diagnostics={"instrument_type": instrument.instrument_type,
+            "price_type": context.pricing.price_type,
+            "quote_source": market.quote_source,
+            "curve_date": market.curve_date.isoformat() if market.curve_date else None})
+
+
+def _price_zero_coupon_bond(instrument: InstrumentSpec, market: MarketState, context: PricingContext) -> PricingResult:
+    if not (instrument.issue_date <= market.valuation_date < instrument.maturity_date):
+        raise ValueError("valuation_date must be on or after issue_date and before maturity_date.")
+
+    time_to_maturity = year_fraction(start_date=market.valuation_date, end_date=instrument.maturity_date, convention=instrument.discount_day_count)
+    dirty_price = instrument.face_value * market.discount_curve.discount_factor(maturity=time_to_maturity, allow_extrapolation=True)
+    accrued_interest = _zero_coupon_accrued_interest(instrument=instrument, market=market)
+    clean_price = dirty_price - accrued_interest
+
+    return PricingResult(
+        instrument_id=instrument.instrument_id,
+        valuation_date=market.valuation_date,
+        clean_price=clean_price,
+        dirty_price=dirty_price,
+        accrued_interest=accrued_interest,
+        currency=instrument.currency,
+        diagnostics={"instrument_type": instrument.instrument_type,
+            "price_type": context.pricing.price_type,
+            "quote_source": market.quote_source,
+            "curve_date": market.curve_date.isoformat() if market.curve_date else None,
+            "time_to_maturity": time_to_maturity,
+            "accrual_method": "constant_yield_accretion" if instrument.issue_price is not None else "none"})
+
+
+def _zero_coupon_accrued_interest(instrument: InstrumentSpec, market: MarketState) -> float:
+    if instrument.issue_price is None:
+        return 0.0
+
+    total_life = year_fraction(start_date=instrument.issue_date, end_date=instrument.maturity_date, convention=instrument.discount_day_count)
+    elapsed = year_fraction(start_date=instrument.issue_date, end_date=market.valuation_date, convention=instrument.discount_day_count)
+    issue_yield = -math.log(instrument.issue_price / instrument.face_value) / total_life
+    accreted_value = instrument.issue_price * math.exp(issue_yield * elapsed)
+    return accreted_value - instrument.issue_price
+
+
+def price(instrument: InstrumentSpec, market:MarketState, *, context:PricingContext|None=None) -> PricingResult:
+    pricing_context = context or PricingContext()
+    return run_pricing_pipeline(instrument=instrument, market=market, context=pricing_context)

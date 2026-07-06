@@ -1,10 +1,5 @@
 """
-SOFR and OIS curve construction.
-
-SOFR is the US overnight secured financing rate. An OIS curve uses overnight
-index swaps to construct discount factors for collateralized USD discounting.
-This module gives the project a first-version SOFR/OIS bootstrapping layer
-separate from the Treasury curve.
+SOFR/OIS and interest-rate curve construction.
 """
 
 import csv
@@ -13,21 +8,11 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from scipy.optimize import brentq
-
 from config import FRED_CACHE_DIR
-from int_rate_convention import (
-    BusinessDayConvention,
-    DateGenerationRule,
-    DayCountConvention,
-    add_months,
-    generate_coupon_schedule,
-    validate_compounding_frequency,
-    validate_rate,
-    year_fraction,
-)
-from market_calendar import MarketCalendar, NEW_YORK_BANK
-from yield_curve import TOLERANCE, ZeroCurve, interpolate_curve_value
+from conventions import (BusinessDayConvention, DateGenerationRule, DayCountConvention, MarketCalendar, NEW_YORK_BANK,
+                         add_months, generate_coupon_schedule, validate_compounding_frequency, validate_rate, year_fraction)
+from curves import TOLERANCE, ZeroCurve, append_unique_curve_point, partial_curve_discount_factor, solve_with_expanding_bracket
+from market_data import export_rows_to_csv, parse_decimal_rate, parse_optional_int
 
 
 @dataclass
@@ -167,71 +152,6 @@ class SOFROISCurveResult:
         ]
 
 
-def _solve_with_expanding_bracket(
-    objective,
-    lower: float = -0.25,
-    upper: float = 0.25,
-    max_abs_bound: float = 5.0,
-) -> float:
-    """
-    Solves one OIS bootstrap equation with a robust rate bracket.
-    """
-
-    lower_value = objective(lower)
-    upper_value = objective(upper)
-
-    while lower_value * upper_value > 0:
-        lower *= 2
-        upper *= 2
-
-        if abs(lower) > max_abs_bound or abs(upper) > max_abs_bound:
-            raise ValueError("Could not bracket a SOFR/OIS zero-rate solution.")
-
-        lower_value = objective(lower)
-        upper_value = objective(upper)
-
-    return brentq(objective, lower, upper)
-
-
-def _discount_factor_with_candidate(
-    time_years: float,
-    solved_maturities: list[float],
-    solved_zero_rates: list[float],
-    candidate_maturity: float,
-    candidate_zero_rate: float,
-) -> float:
-    """
-    Discounts an OIS fixed-leg cashflow while solving the current node.
-    """
-
-    if time_years == 0:
-        return 1.0
-
-    zero_rate = interpolate_curve_value(target_time=time_years, times=solved_maturities + [candidate_maturity], values=solved_zero_rates + [candidate_zero_rate],
-                                        allow_left_extrapolation=True, empty_error="At least one curve point is required.",
-                                        right_error="Interpolation target is beyond the candidate maturity.")
-
-    return math.exp(-zero_rate * time_years)
-
-
-def _append_curve_point(
-    solved_maturities: list[float],
-    solved_zero_rates: list[float],
-    maturity_years: float,
-    zero_rate: float,
-) -> None:
-    """
-    Adds an OIS node and rejects duplicate maturities.
-    """
-
-    for existing_maturity in solved_maturities:
-        if math.isclose(maturity_years, existing_maturity, rel_tol=0.0, abs_tol=TOLERANCE):
-            raise ValueError(f"Duplicate SOFR/OIS maturity: {maturity_years}.")
-
-    solved_maturities.append(maturity_years)
-    solved_zero_rates.append(zero_rate)
-
-
 def _overnight_point(
     effective_date: date,
     overnight_rate: float,
@@ -353,44 +273,49 @@ def bootstrap_sofr_ois_curve(
             annuity = 0.0
 
             for payment_time, accrual in payment_grid:
-                annuity += accrual * _discount_factor_with_candidate(
+                annuity += accrual * partial_curve_discount_factor(
                     time_years=payment_time,
                     solved_maturities=solved_maturities,
                     solved_zero_rates=solved_zero_rates,
                     candidate_maturity=maturity_years,
                     candidate_zero_rate=candidate_zero_rate,
+                    allow_left_extrapolation=True,
+                    empty_error="At least one curve point is required.",
+                    right_error="Interpolation target is beyond the candidate maturity.",
                 )
 
-            final_discount_factor = _discount_factor_with_candidate(
+            final_discount_factor = partial_curve_discount_factor(
                 time_years=maturity_years,
                 solved_maturities=solved_maturities,
                 solved_zero_rates=solved_zero_rates,
                 candidate_maturity=maturity_years,
                 candidate_zero_rate=candidate_zero_rate,
+                allow_left_extrapolation=True,
+                empty_error="At least one curve point is required.",
+                right_error="Interpolation target is beyond the candidate maturity.",
             )
 
             return quote.fixed_rate * annuity + final_discount_factor - 1.0
 
-        zero_rate = _solve_with_expanding_bracket(ois_par_error)
+        zero_rate = solve_with_expanding_bracket(ois_par_error, failure_message="Could not bracket a SOFR/OIS zero-rate solution.")
         discount_factor = math.exp(-zero_rate * maturity_years)
         fixed_leg_annuity = sum(
             accrual
-            * _discount_factor_with_candidate(
+            * partial_curve_discount_factor(
                 time_years=payment_time,
                 solved_maturities=solved_maturities,
                 solved_zero_rates=solved_zero_rates,
                 candidate_maturity=maturity_years,
                 candidate_zero_rate=zero_rate,
+                allow_left_extrapolation=True,
+                empty_error="At least one curve point is required.",
+                right_error="Interpolation target is beyond the candidate maturity.",
             )
             for payment_time, accrual in payment_grid
         )
 
-        _append_curve_point(
-            solved_maturities=solved_maturities,
-            solved_zero_rates=solved_zero_rates,
-            maturity_years=maturity_years,
-            zero_rate=zero_rate,
-        )
+        append_unique_curve_point(maturities=solved_maturities, values=solved_zero_rates, maturity=maturity_years, value=zero_rate,
+                                  duplicate_message=f"Duplicate SOFR/OIS maturity: {maturity_years}.", tolerance=TOLERANCE)
         bootstrap_points.append(
             OISBootstrapPoint(
                 quote_type="OIS",
@@ -410,37 +335,6 @@ def bootstrap_sofr_ois_curve(
         curve=curve,
         points=bootstrap_points,
     )
-
-
-def _parse_optional_float(row: dict[str, str], column: str) -> float | None:
-    value = row.get(column, "").strip()
-
-    if value == "":
-        return None
-
-    return float(value)
-
-
-def _parse_decimal_rate(row: dict[str, str], column: str) -> float:
-    value = _parse_optional_float(row, column)
-
-    if value is None:
-        raise ValueError(f"{column} is required.")
-
-    if abs(value) > 1:
-        return value / 100
-
-    return value
-
-
-def _parse_optional_int(row: dict[str, str], column: str) -> int | None:
-    value = row.get(column, "").strip()
-
-    if value == "":
-        return None
-
-    return int(value)
-
 
 def load_ois_quotes_from_csv(path: str | Path) -> list[OISQuote]:
     """
@@ -462,13 +356,13 @@ def load_ois_quotes_from_csv(path: str | Path) -> list[OISQuote]:
             try:
                 maturity_text = row.get("maturity_date", "").strip()
                 maturity = date.fromisoformat(maturity_text) if maturity_text else None
-                tenor_months = _parse_optional_int(row, "tenor_months")
-                fixed_leg_frequency = _parse_optional_int(row, "fixed_leg_frequency") or 1
+                tenor_months = parse_optional_int(row, "tenor_months")
+                fixed_leg_frequency = parse_optional_int(row, "fixed_leg_frequency") or 1
                 fixed_leg_day_count = row.get("fixed_leg_day_count", "").strip() or DayCountConvention.ACT_360
 
                 quotes.append(
                     OISQuote(
-                        fixed_rate=_parse_decimal_rate(row, "fixed_rate"),
+                        fixed_rate=parse_decimal_rate(row, "fixed_rate", required=True),
                         tenor_months=tenor_months,
                         maturity_date=maturity,
                         fixed_leg_frequency=fixed_leg_frequency,
@@ -497,7 +391,7 @@ def load_latest_sofr_fixing_from_fred(
 
     import pandas as pd
 
-    from market_data_loader import download_fred_series_with_cache
+    from market_data import download_fred_series_with_cache
 
     series_id = "SOFR"
     df = download_fred_series_with_cache(
@@ -537,14 +431,4 @@ def export_sofr_ois_curve_report(
     Writes an auditable CSV report for a SOFR/OIS bootstrap.
     """
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = result.rows()
-
-    with output_path.open("w", newline="", encoding="utf-8") as file:
-        fieldnames = list(rows[0]) if rows else []
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    return output_path
+    return export_rows_to_csv(result.rows(), output_path)

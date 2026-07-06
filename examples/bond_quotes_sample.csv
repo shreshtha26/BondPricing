@@ -1,0 +1,3 @@
+security_id,valuation_date,clean_price,dirty_price,bid,ask,quote_source,price_type,currency
+SAMPLEFIXED1,2024-06-25,100.10,,,,SAMPLE_FILE,clean,USD
+SAMPLEZERO1,2024-06-25,,85.73,,,SAMPLE_FILE,dirty,USD

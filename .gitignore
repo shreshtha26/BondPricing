@@ -1,4 +1,9 @@
-# Python bytecode and test caches
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache/build files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,27 +13,45 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Build/distribution
+build/
+dist/
+*.egg-info/
 
-# IDE and OS files
+# IDE/editor
 .idea/
 .vscode/
+*.iml
+
+# OS files
 .DS_Store
 __MACOSX/
 
-# Generated project outputs
-outputs/*
-!outputs/.gitkeep
-curve_plot.html
-sample_curve_plot.html
-
-# Downloaded market-data cache
-data/fred_cache/*
-!data/fred_cache/.gitkeep
-
-# Local environment files
+# Environment/secrets
 .env
 .env.*
+*.key
+*.pem
+*.p12
+secrets/
+credentials/
+
+# Logs/temp files
+*.log
+*.tmp
+*.bak
+
+# Generated outputs
+outputs/
+reports/
+*.html
+
+# Cached market data
+data/fred_cache/
+
+# Large or vendor data
+data/raw/
+data/vendor/
+*.zip
+*.parquet
+*.pkl

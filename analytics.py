@@ -4,12 +4,15 @@ Calibration, validation, risk analytics, valuation snapshots, and P&L explain.
 
 import math
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, time
 from pathlib import Path
 from conventions import BASIS_POINT, validate_rate
 from curves import TOLERANCE, ZeroCurve
-from market_data import BondMarketQuote, SecurityMasterRecord, TreasuryCurveSnapshot, export_rows_to_csv
-from pricing import DateAwareFixedCouponBond, MarketState, PricingContext, PricingResult, price
+from market_data import BondMarketQuote, CurveMetadata, SecurityMasterRecord, TreasuryCurveSnapshot, export_rows_to_csv
+from pricing import (DateAwareFixedCouponBond, MarketState, PricingContext, PricingResult, cashflow_curve_dv01,
+                     cashflow_curve_risk,
+                     dirty_price_from_clean, future_cashflows_from_instrument, price, solve_cashflow_yield,
+                     solve_z_spread)
 
 
 @dataclass
@@ -210,11 +213,47 @@ class BondQuoteValidationRow:
     instrument_type: str
     quote_source: str
     price_type: str
+    curve_name: str
+    curve_source: str
+    curve_type: str
+    curve_date: date | None
+    curve_build_method: str
+    curve_role: str
+    discount_curve_used: str
+    curve_calibration_status: str
+    curve_calibration_residual_bp: float | None
     market_price: float
     model_price: float
+    base_model_price: float
+    spread_price_impact: float
+    pricing_z_spread: float
+    pricing_z_spread_bp: float
     clean_price: float
     dirty_price: float
     accrued_interest: float
+    market_dirty_price: float
+    market_implied_yield: float
+    model_implied_yield: float
+    yield_error_bp: float
+    z_spread: float
+    z_spread_bp: float
+    parallel_dv01: float
+    effective_duration: float
+    effective_convexity: float
+    residual_explanation: str
+    quote_type: str
+    quote_timestamp: datetime | None
+    quote_age_days: float | None
+    quote_stale: bool
+    quote_evaluated: bool
+    quote_traded: bool
+    quote_override: bool
+    clean_dirty_mismatch: bool
+    data_quality_flags: str
+    source_system: str | None
+    source_record_id: str | None
+    convention_level: str
+    convention_warnings: str
     bid: float | None = None
     ask: float | None = None
     tolerance: float = 0.02
@@ -250,24 +289,155 @@ class BondQuoteValidationRow:
             "instrument_type": self.instrument_type,
             "quote_source": self.quote_source,
             "price_type": self.price_type,
+            "curve_name": self.curve_name,
+            "curve_source": self.curve_source,
+            "curve_type": self.curve_type,
+            "curve_date": self.curve_date.isoformat() if self.curve_date else None,
+            "curve_build_method": self.curve_build_method,
+            "curve_role": self.curve_role,
+            "discount_curve_used": self.discount_curve_used,
+            "curve_calibration_status": self.curve_calibration_status,
+            "curve_calibration_residual_bp": self.curve_calibration_residual_bp,
             "market_price": self.market_price,
             "model_price": self.model_price,
+            "base_model_price": self.base_model_price,
             "price_error": self.price_error,
             "price_error_bp_of_par": self.price_error_bp_of_par,
+            "spread_price_impact": self.spread_price_impact,
+            "pricing_z_spread": self.pricing_z_spread,
+            "pricing_z_spread_bp": self.pricing_z_spread_bp,
+            "market_dirty_price": self.market_dirty_price,
+            "clean_price": self.clean_price,
+            "dirty_price": self.dirty_price,
+            "accrued_interest": self.accrued_interest,
+            "market_implied_yield": self.market_implied_yield,
+            "model_implied_yield": self.model_implied_yield,
+            "yield_error_bp": self.yield_error_bp,
+            "z_spread": self.z_spread,
+            "z_spread_bp": self.z_spread_bp,
+            "parallel_dv01": self.parallel_dv01,
+            "effective_duration": self.effective_duration,
+            "effective_convexity": self.effective_convexity,
             "bid": self.bid,
             "ask": self.ask,
             "inside_bid_ask": self.inside_bid_ask,
             "validation_status": self.validation_status,
-            "clean_price": self.clean_price,
-            "dirty_price": self.dirty_price,
-            "accrued_interest": self.accrued_interest,
+            "residual_explanation": self.residual_explanation,
+            "quote_type": self.quote_type,
+            "quote_timestamp": self.quote_timestamp.isoformat() if self.quote_timestamp else None,
+            "quote_age_days": self.quote_age_days,
+            "quote_stale": self.quote_stale,
+            "quote_evaluated": self.quote_evaluated,
+            "quote_traded": self.quote_traded,
+            "quote_override": self.quote_override,
+            "clean_dirty_mismatch": self.clean_dirty_mismatch,
+            "data_quality_flags": self.data_quality_flags,
+            "source_system": self.source_system,
+            "source_record_id": self.source_record_id,
+            "convention_level": self.convention_level,
+            "convention_warnings": self.convention_warnings,
             "tolerance": self.tolerance,
             "currency": self.currency,
         }
 
 
+def _market_dirty_price(quote: BondMarketQuote, accrued_interest: float) -> float:
+    market_price = quote.effective_price()
+    if quote.price_type == "dirty":
+        return market_price
+    return dirty_price_from_clean(clean_price=market_price, accrued=accrued_interest)
+
+
+def _inside_bid_ask(model_price: float, bid: float | None, ask: float | None) -> bool | None:
+    if bid is None or ask is None:
+        return None
+    return bid <= model_price <= ask
+
+
+def _quote_as_of_datetime(quote: BondMarketQuote) -> datetime:
+    return datetime.combine(quote.valuation_date, time(hour=23, minute=59, second=59))
+
+
+def _quote_age_days(quote: BondMarketQuote) -> float | None:
+    age_seconds = quote.age_seconds(_quote_as_of_datetime(quote))
+    if age_seconds is None:
+        return None
+    return age_seconds / 86400
+
+
+def _data_quality_flags(quote: BondMarketQuote, accrued_interest: float, tolerance: float,
+                        max_quote_age_days: float | None) -> list[str]:
+    flags: list[str] = []
+    quote_age_days = _quote_age_days(quote)
+    max_age_seconds = None if max_quote_age_days is None else max_quote_age_days * 86400
+    if quote.timestamp is None:
+        flags.append("MISSING_TIMESTAMP")
+    elif quote_age_days is not None and quote_age_days < -1 / 24:
+        flags.append("FUTURE_TIMESTAMP")
+    if quote.bid is None or quote.ask is None:
+        flags.append("MISSING_BID_ASK")
+    if quote.observed_price is None:
+        flags.append("MISSING_OBSERVED_PRICE")
+    if quote.quote_source.strip().upper() == "UNKNOWN":
+        flags.append("UNKNOWN_QUOTE_SOURCE")
+    if quote.is_stale_as_of(_quote_as_of_datetime(quote), max_age_seconds):
+        flags.append("STALE_QUOTE")
+    if quote.override_flag:
+        flags.append("OVERRIDE_QUOTE")
+    if quote.is_evaluated:
+        flags.append("EVALUATED_PRICE")
+    if quote.is_traded:
+        flags.append("TRADED_PRICE")
+    if quote.clean_dirty_mismatch(accrued_interest=accrued_interest, tolerance=tolerance):
+        flags.append("CLEAN_DIRTY_MISMATCH")
+    return flags or ["OK"]
+
+
+def _has_major_data_quality_issue(flags: list[str] | str) -> bool:
+    if isinstance(flags, str):
+        flag_set = set(flags.split(";"))
+    else:
+        flag_set = set(flags)
+    return bool(flag_set & {"UNKNOWN_QUOTE_SOURCE", "STALE_QUOTE", "OVERRIDE_QUOTE", "CLEAN_DIRTY_MISMATCH", "FUTURE_TIMESTAMP"})
+
+
+def _convention_warnings(security: SecurityMasterRecord) -> str:
+    warnings = ["DESK_STYLE_CONVENTIONS", "NO_EX_COUPON_RULES", "NO_VENDOR_CERTIFIED_CALENDAR"]
+    if security.instrument_type == "fixed_coupon_bond":
+        warnings.append("NO_ODD_COUPON_SPECIAL_HANDLING")
+    if security.instrument_type == "zero_coupon_bond":
+        warnings.append("ZERO_ACCRUAL_USES_CONSTANT_YIELD_WHEN_ISSUE_PRICE_SUPPLIED")
+    return ";".join(warnings)
+
+
+def _residual_explanation(price_error: float, tolerance: float, inside_bid_ask: bool | None,
+                          price_type: str, accrued_interest: float, z_spread: float,
+                          pricing_z_spread: float,
+                          data_quality_flags: list[str],
+                          quote_source: str) -> str:
+    if inside_bid_ask is True:
+        return "PASS_BID_ASK"
+    if abs(price_error) <= tolerance:
+        return "PASS_TOLERANCE"
+    if not quote_source.strip() or quote_source.strip().upper() == "UNKNOWN" or _has_major_data_quality_issue(data_quality_flags):
+        return "POSSIBLE_DATA_QUALITY_ISSUE"
+    if price_type == "clean" and abs(accrued_interest) > tolerance:
+        accrual_gap = abs(abs(price_error) - abs(accrued_interest))
+        if accrual_gap <= max(tolerance, 0.10 * abs(accrued_interest)):
+            return "POSSIBLE_ACCRUAL_MISMATCH"
+    if abs(pricing_z_spread) > 0:
+        return "APPLIED_SPREAD_PRICING_EFFECT"
+    if abs(z_spread) >= 5 * BASIS_POINT:
+        return "POSSIBLE_SPREAD_OR_CREDIT_EFFECT"
+    if price_error > 0:
+        return "PRICE_ABOVE_MARKET"
+    return "PRICE_BELOW_MARKET"
+
+
 def validate_bond_quote(security: SecurityMasterRecord, quote: BondMarketQuote, curve: ZeroCurve,
-                        context: PricingContext | None = None, tolerance: float = 0.02) -> BondQuoteValidationRow:
+                        context: PricingContext | None = None, tolerance: float = 0.02,
+                        curve_metadata: CurveMetadata | None = None,
+                        max_quote_age_days: float | None = 1.0) -> BondQuoteValidationRow:
     """
     Prices one security-master record and compares it with one observed quote.
     This is the compact first CUSIP/ISIN-level validation workflow.
@@ -276,10 +446,32 @@ def validate_bond_quote(security: SecurityMasterRecord, quote: BondMarketQuote, 
         raise ValueError("security and quote must have the same security_id.")
     if security.currency != quote.currency:
         raise ValueError("security and quote currencies must match.")
+    metadata = curve_metadata or CurveMetadata.unknown()
     instrument = security.to_instrument_spec()
-    market = MarketState(valuation_date=quote.valuation_date, discount_curve=curve, quote_source=quote.quote_source, quote_timestamp=quote.timestamp)
+    market = MarketState(valuation_date=quote.valuation_date, discount_curve=curve, curve_date=metadata.curve_date,
+                         quote_source=quote.quote_source, quote_timestamp=quote.timestamp)
     result: PricingResult = price(instrument, market, context=context)
+    cashflows = future_cashflows_from_instrument(instrument=instrument, valuation_date=quote.valuation_date)
+    market_price = quote.effective_price()
+    market_dirty_price = _market_dirty_price(quote=quote, accrued_interest=result.accrued_interest)
     model_price = result.clean_price if quote.price_type == "clean" else result.dirty_price
+    base_model_price = float(result.diagnostics["base_clean_price"] if quote.price_type == "clean" else result.diagnostics["base_dirty_price"])
+    spread_price_impact = float(result.diagnostics["spread_price_impact"])
+    pricing_z_spread = float(result.diagnostics["applied_z_spread"])
+    market_implied_yield = solve_cashflow_yield(dirty_price=market_dirty_price, cashflows=cashflows, frequency=security.frequency)
+    model_implied_yield = solve_cashflow_yield(dirty_price=result.dirty_price, cashflows=cashflows, frequency=security.frequency)
+    yield_error_bp = (model_implied_yield - market_implied_yield) * 10000
+    z_spread = solve_z_spread(dirty_price=market_dirty_price, cashflows=cashflows, curve=curve)
+    risk_curve = curve.bumped(pricing_z_spread) if pricing_z_spread else curve
+    curve_risk = cashflow_curve_risk(cashflows=cashflows, curve=risk_curve)
+    data_quality_flags = _data_quality_flags(quote=quote, accrued_interest=result.accrued_interest,
+                                             tolerance=tolerance, max_quote_age_days=max_quote_age_days)
+    residual_explanation = _residual_explanation(price_error=model_price - market_price, tolerance=tolerance,
+                                                 inside_bid_ask=_inside_bid_ask(model_price=model_price, bid=quote.bid, ask=quote.ask),
+                                                 price_type=quote.price_type, accrued_interest=result.accrued_interest,
+                                                 z_spread=z_spread, pricing_z_spread=pricing_z_spread,
+                                                 data_quality_flags=data_quality_flags,
+                                                 quote_source=quote.quote_source)
     return BondQuoteValidationRow(
         security_id=security.security_id,
         id_type=security.id_type,
@@ -287,11 +479,47 @@ def validate_bond_quote(security: SecurityMasterRecord, quote: BondMarketQuote, 
         instrument_type=security.instrument_type,
         quote_source=quote.quote_source,
         price_type=quote.price_type,
-        market_price=quote.effective_price(),
+        curve_name=metadata.curve_name,
+        curve_source=metadata.curve_source,
+        curve_type=metadata.curve_type,
+        curve_date=metadata.curve_date,
+        curve_build_method=metadata.curve_build_method,
+        curve_role=metadata.curve_role,
+        discount_curve_used=metadata.discount_curve_used,
+        curve_calibration_status=metadata.calibration_status,
+        curve_calibration_residual_bp=metadata.calibration_residual_bp,
+        market_price=market_price,
         model_price=model_price,
+        base_model_price=base_model_price,
+        spread_price_impact=spread_price_impact,
+        pricing_z_spread=pricing_z_spread,
+        pricing_z_spread_bp=pricing_z_spread * 10000,
         clean_price=result.clean_price,
         dirty_price=result.dirty_price,
         accrued_interest=result.accrued_interest,
+        market_dirty_price=market_dirty_price,
+        market_implied_yield=market_implied_yield,
+        model_implied_yield=model_implied_yield,
+        yield_error_bp=yield_error_bp,
+        z_spread=z_spread,
+        z_spread_bp=z_spread * 10000,
+        parallel_dv01=curve_risk["parallel_dv01"],
+        effective_duration=curve_risk["effective_duration"],
+        effective_convexity=curve_risk["effective_convexity"],
+        residual_explanation=residual_explanation,
+        quote_type=quote.quote_type,
+        quote_timestamp=quote.timestamp,
+        quote_age_days=_quote_age_days(quote),
+        quote_stale=quote.is_stale_as_of(_quote_as_of_datetime(quote), None if max_quote_age_days is None else max_quote_age_days * 86400),
+        quote_evaluated=quote.is_evaluated,
+        quote_traded=quote.is_traded,
+        quote_override=quote.override_flag,
+        clean_dirty_mismatch=quote.clean_dirty_mismatch(accrued_interest=result.accrued_interest, tolerance=tolerance),
+        data_quality_flags=";".join(data_quality_flags),
+        source_system=quote.source_system,
+        source_record_id=quote.source_record_id,
+        convention_level="DESK_APPROXIMATION",
+        convention_warnings=_convention_warnings(security),
         bid=quote.bid,
         ask=quote.ask,
         tolerance=tolerance,
@@ -300,18 +528,120 @@ def validate_bond_quote(security: SecurityMasterRecord, quote: BondMarketQuote, 
 
 
 def validate_bond_quotes(securities: list[SecurityMasterRecord], quotes: list[BondMarketQuote], curve: ZeroCurve,
-                         context: PricingContext | None = None, tolerance: float = 0.02) -> list[BondQuoteValidationRow]:
+                         context: PricingContext | None = None, tolerance: float = 0.02,
+                         curve_metadata: CurveMetadata | None = None,
+                         max_quote_age_days: float | None = 1.0) -> list[BondQuoteValidationRow]:
     security_by_id = {security.security_id: security for security in securities}
     rows: list[BondQuoteValidationRow] = []
     for quote in quotes:
         if quote.security_id not in security_by_id:
             raise KeyError(f"Missing security master record for {quote.security_id}.")
-        rows.append(validate_bond_quote(security=security_by_id[quote.security_id], quote=quote, curve=curve, context=context, tolerance=tolerance))
+        rows.append(validate_bond_quote(security=security_by_id[quote.security_id], quote=quote, curve=curve,
+                                        context=context, tolerance=tolerance, curve_metadata=curve_metadata,
+                                        max_quote_age_days=max_quote_age_days))
     return rows
 
 
 def export_bond_quote_validation_report(rows: list[BondQuoteValidationRow], output_path: str | Path) -> Path:
     return export_rows_to_csv((row.row() for row in rows), output_path)
+
+
+def _single_or_multiple(values: list[str | None]) -> str | None:
+    unique_values = sorted({value for value in values if value is not None})
+    if not unique_values:
+        return None
+    if len(unique_values) == 1:
+        return unique_values[0]
+    return "MULTIPLE"
+
+
+@dataclass
+class BondQuoteValidationSummary:
+    """
+    File-level summary for a batch of bond quote validations.
+    """
+    valuation_date: str | None
+    curve_name: str | None
+    curve_date: str | None
+    total_bonds: int
+    passed: int
+    failed: int
+    pass_rate: float
+    max_abs_price_error: float
+    max_abs_yield_error_bp: float
+    max_abs_z_spread_bp: float
+    max_effective_duration: float
+    max_effective_convexity: float
+    total_parallel_dv01: float
+    largest_residual_security_id: str | None
+    data_quality_issue_count: int
+    stale_quote_count: int
+    evaluated_quote_count: int
+    traded_quote_count: int
+    clean_dirty_mismatch_count: int
+    spread_or_credit_issue_count: int
+
+    def row(self) -> dict[str, float | int | str | None]:
+        return {
+            "valuation_date": self.valuation_date,
+            "curve_name": self.curve_name,
+            "curve_date": self.curve_date,
+            "total_bonds": self.total_bonds,
+            "passed": self.passed,
+            "failed": self.failed,
+            "pass_rate": self.pass_rate,
+            "max_abs_price_error": self.max_abs_price_error,
+            "max_abs_yield_error_bp": self.max_abs_yield_error_bp,
+            "max_abs_z_spread_bp": self.max_abs_z_spread_bp,
+            "max_effective_duration": self.max_effective_duration,
+            "max_effective_convexity": self.max_effective_convexity,
+            "total_parallel_dv01": self.total_parallel_dv01,
+            "largest_residual_security_id": self.largest_residual_security_id,
+            "data_quality_issue_count": self.data_quality_issue_count,
+            "stale_quote_count": self.stale_quote_count,
+            "evaluated_quote_count": self.evaluated_quote_count,
+            "traded_quote_count": self.traded_quote_count,
+            "clean_dirty_mismatch_count": self.clean_dirty_mismatch_count,
+            "spread_or_credit_issue_count": self.spread_or_credit_issue_count,
+        }
+
+
+def bond_quote_validation_summary(rows: list[BondQuoteValidationRow]) -> BondQuoteValidationSummary:
+    if not rows:
+        raise ValueError("At least one bond quote validation row is required.")
+    passed = sum(1 for row in rows if row.validation_status != "FAIL")
+    failed = len(rows) - passed
+    largest_residual = max(rows, key=lambda row: abs(row.price_error))
+    return BondQuoteValidationSummary(
+        valuation_date=_single_or_multiple([row.valuation_date.isoformat() for row in rows]),
+        curve_name=_single_or_multiple([row.curve_name for row in rows]),
+        curve_date=_single_or_multiple([row.curve_date.isoformat() if row.curve_date else None for row in rows]),
+        total_bonds=len(rows),
+        passed=passed,
+        failed=failed,
+        pass_rate=passed / len(rows),
+        max_abs_price_error=max(abs(row.price_error) for row in rows),
+        max_abs_yield_error_bp=max(abs(row.yield_error_bp) for row in rows),
+        max_abs_z_spread_bp=max(abs(row.z_spread_bp) for row in rows),
+        max_effective_duration=max(row.effective_duration for row in rows),
+        max_effective_convexity=max(row.effective_convexity for row in rows),
+        total_parallel_dv01=sum(row.parallel_dv01 for row in rows),
+        largest_residual_security_id=largest_residual.security_id,
+        data_quality_issue_count=sum(1 for row in rows if row.residual_explanation == "POSSIBLE_DATA_QUALITY_ISSUE" or _has_major_data_quality_issue(row.data_quality_flags)),
+        stale_quote_count=sum(1 for row in rows if row.quote_stale),
+        evaluated_quote_count=sum(1 for row in rows if row.quote_evaluated),
+        traded_quote_count=sum(1 for row in rows if row.quote_traded),
+        clean_dirty_mismatch_count=sum(1 for row in rows if row.clean_dirty_mismatch),
+        spread_or_credit_issue_count=sum(1 for row in rows if row.residual_explanation == "POSSIBLE_SPREAD_OR_CREDIT_EFFECT"),
+    )
+
+
+def bond_quote_validation_summary_rows(rows: list[BondQuoteValidationRow]) -> list[dict[str, float | int | str | None]]:
+    return [bond_quote_validation_summary(rows).row()]
+
+
+def export_bond_quote_validation_summary(rows: list[BondQuoteValidationRow], output_path: str | Path) -> Path:
+    return export_rows_to_csv(bond_quote_validation_summary_rows(rows), output_path)
 
 
 def export_report_rows(rows: list[dict[str, float | str | bool]], output_path: str | Path) -> Path:

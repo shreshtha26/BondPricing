@@ -7,12 +7,15 @@ import logging
 import math
 from datetime import date
 from pathlib import Path
-from config import DEFAULT_CURVE_BUILD_SETTINGS, DEFAULT_WORKFLOW_SETTINGS
-from market_data import (TreasuryCurveSnapshot, export_rows_to_csv, load_bond_market_quotes_from_csv,
+from config import DEFAULT_CURVE_BUILD_SETTINGS, DEFAULT_WORKFLOW_SETTINGS, PricingConfig
+from curves import ZeroCurve
+from market_data import (CurveMetadata, TreasuryCurveSnapshot, export_rows_to_csv, load_bond_market_quotes_from_csv,
                          load_fred_treasury_curve_snapshot, load_security_master_from_csv)
 from rates import bootstrap_sofr_ois_curve, export_sofr_ois_curve_report, load_latest_sofr_fixing_from_fred,load_ois_quotes_from_csv
 from treasury import TreasuryInstrumentCurveResult,bootstrap_treasury_zero_curve_from_prices,export_treasury_bootstrap_report,load_treasury_instruments_from_csv
-from analytics import calibration_report_rows, export_bond_quote_validation_report, export_report_rows, validate_bond_quotes
+from analytics import (calibration_report_rows, export_bond_quote_validation_report,
+                       export_bond_quote_validation_summary, export_report_rows, validate_bond_quotes)
+from pricing import PricingContext
 
 
 def parse_date(value: str | None) -> date | None:
@@ -39,6 +42,16 @@ def parse_rate(value: float | None) -> float | None:
     if abs(value) > 1:
         return value / 100
     return value
+
+
+def parse_basis_points(value: float | None) -> float:
+    """Convert basis points into a decimal spread."""
+
+    if value is None:
+        return 0.0
+    if not math.isfinite(value):
+        raise ValueError(f"Invalid basis-point value '{value}'. Please use a finite number.")
+    return value / 10000
 
 
 def setup_logging(output_dir: Path) -> None:
@@ -92,6 +105,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bond-quote-tolerance", type=float, default=0.02,
                         help="Allowed model-vs-market price difference per 100 face value.")
 
+    parser.add_argument("--validation-curve", choices=["cmt", "treasury-instruments", "sofr-ois"], default="cmt",
+                        help="Curve used for bond quote validation. Alternate choices require the matching curve CSV input.")
+
+    parser.add_argument("--validation-z-spread-bp", type=float, default=0.0,
+                        help="Optional constant spread, in basis points, added to the validation curve before pricing bonds.")
+
+    parser.add_argument("--max-quote-age-days", type=float, default=1.0,
+                        help="Quote age threshold for stale-quote diagnostics. Use 0 for same-day-only timestamps.")
+
     return parser
 
 
@@ -120,6 +142,33 @@ def export_curve_report(snapshot: TreasuryCurveSnapshot, output_path: Path) -> N
                        fieldnames=["valuation_date", "source", "quote_type", "curve_build_method", "interpolation_method",
                                    "extrapolation_method", "maturity", "par_yield", "zero_rate", "discount_factor",
                                    "forward_start", "forward_end", "forward_rate"])
+
+
+def summarize_curve_calibration(rows: list[dict[str, float | str]]) -> tuple[str, float | None]:
+    if not rows:
+        return "NOT_RUN", None
+    max_abs_residual_bp = max(abs(float(row["residual_bp"])) for row in rows)
+    status = "FAIL" if any(row["calibration_status"] == "FAIL" for row in rows) else "PASS_TOLERANCE"
+    return status, max_abs_residual_bp
+
+
+def select_validation_curve(validation_curve: str, cmt_curve: ZeroCurve, cmt_metadata: CurveMetadata,
+                            treasury_result: TreasuryInstrumentCurveResult | None = None,
+                            sofr_ois_result = None) -> tuple[ZeroCurve, CurveMetadata]:
+    """
+    Selects the curve used for bond quote validation.
+    """
+    if validation_curve == "cmt":
+        return cmt_curve, cmt_metadata
+    if validation_curve == "treasury-instruments":
+        if treasury_result is None:
+            raise ValueError("--validation-curve treasury-instruments requires --treasury-instruments-csv.")
+        return treasury_result.curve, CurveMetadata.from_treasury_instrument_result(treasury_result)
+    if validation_curve == "sofr-ois":
+        if sofr_ois_result is None:
+            raise ValueError("--validation-curve sofr-ois requires --ois-quotes-csv.")
+        return sofr_ois_result.curve, CurveMetadata.from_sofr_ois_result(sofr_ois_result)
+    raise ValueError(f"Unsupported validation curve: {validation_curve}.")
 
 
 def print_treasury_instrument_curve_report(result: TreasuryInstrumentCurveResult) -> None:
@@ -175,6 +224,7 @@ def main() -> None:
     sofr_ois_report_path = output_dir / "sofr_ois_curve_report.csv"
     calibration_report_path = output_dir / "calibration_report.csv"
     bond_quote_validation_report_path = output_dir / DEFAULT_WORKFLOW_SETTINGS.bond_quote_validation_report_path.name
+    bond_quote_validation_summary_path = output_dir / "bond_quote_validation_summary.csv"
     snapshot = load_fred_treasury_curve_snapshot(date=args.date, frequency=args.frequency,
         cache_dir=DEFAULT_WORKFLOW_SETTINGS.fred_cache_dir, use_cache=not args.no_cache, refresh_cache=args.refresh_cache)
     curve = snapshot.to_zero_curve()
@@ -182,14 +232,9 @@ def main() -> None:
     export_curve_report(snapshot=snapshot, output_path=curve_report_path)
     calibration_rows = calibration_report_rows(snapshot)
     export_report_rows(rows=calibration_rows, output_path=calibration_report_path)
-    bond_quote_validation_rows = None
-    if args.security_master_csv is not None or args.bond_quotes_csv is not None:
-        if args.security_master_csv is None or args.bond_quotes_csv is None:
-            raise ValueError("--security-master-csv and --bond-quotes-csv must be supplied together.")
-        securities = load_security_master_from_csv(args.security_master_csv)
-        quotes = load_bond_market_quotes_from_csv(args.bond_quotes_csv)
-        bond_quote_validation_rows = validate_bond_quotes(securities=securities, quotes=quotes, curve=curve, tolerance=args.bond_quote_tolerance)
-        export_bond_quote_validation_report(rows=bond_quote_validation_rows, output_path=bond_quote_validation_report_path)
+    calibration_status, calibration_residual_bp = summarize_curve_calibration(calibration_rows)
+    cmt_curve_metadata = CurveMetadata.from_treasury_snapshot(snapshot=snapshot, calibration_status=calibration_status,
+                                                              calibration_residual_bp=calibration_residual_bp)
     treasury_result = None
     if args.treasury_instruments_csv is not None:
         treasury_instruments = load_treasury_instruments_from_csv(args.treasury_instruments_csv)
@@ -197,6 +242,7 @@ def main() -> None:
             settlement_date=settlement_date, allow_short_end_extrapolation=args.allow_short_end_extrapolation)
         export_treasury_bootstrap_report(result=treasury_result,output_path=treasury_instrument_report_path)
     sofr_ois_rows = None
+    sofr_ois_result = None
     if args.ois_quotes_csv is not None:
         ois_quotes = load_ois_quotes_from_csv(args.ois_quotes_csv)
         sofr_rate = parse_rate(args.sofr_rate)
@@ -207,6 +253,23 @@ def main() -> None:
         sofr_ois_result = bootstrap_sofr_ois_curve(effective_date=settlement_date,overnight_rate=sofr_rate,ois_quotes=ois_quotes)
         export_sofr_ois_curve_report(result=sofr_ois_result,output_path=sofr_ois_report_path)
         sofr_ois_rows = sofr_ois_result.rows()
+    bond_quote_validation_rows = None
+    if args.security_master_csv is not None or args.bond_quotes_csv is not None:
+        if args.security_master_csv is None or args.bond_quotes_csv is None:
+            raise ValueError("--security-master-csv and --bond-quotes-csv must be supplied together.")
+        validation_curve, validation_curve_metadata = select_validation_curve(validation_curve=args.validation_curve, cmt_curve=curve,
+            cmt_metadata=cmt_curve_metadata, treasury_result=treasury_result, sofr_ois_result=sofr_ois_result)
+        validation_z_spread = parse_basis_points(args.validation_z_spread_bp)
+        validation_context = PricingContext(pricing=PricingConfig(z_spread=validation_z_spread,
+            z_spread_source="cli_validation_z_spread_bp" if validation_z_spread else "none"))
+        securities = load_security_master_from_csv(args.security_master_csv)
+        quotes = load_bond_market_quotes_from_csv(args.bond_quotes_csv)
+        bond_quote_validation_rows = validate_bond_quotes(securities=securities, quotes=quotes, curve=validation_curve,
+                                                          context=validation_context, tolerance=args.bond_quote_tolerance,
+                                                          curve_metadata=validation_curve_metadata,
+                                                          max_quote_age_days=args.max_quote_age_days)
+        export_bond_quote_validation_report(rows=bond_quote_validation_rows, output_path=bond_quote_validation_report_path)
+        export_bond_quote_validation_summary(rows=bond_quote_validation_rows, output_path=bond_quote_validation_summary_path)
     print_curve_report(snapshot)
     print()
     print(f"Wrote curve report to:     {curve_report_path}")
@@ -218,6 +281,7 @@ def main() -> None:
     if bond_quote_validation_rows is not None:
         failed = sum(1 for row in bond_quote_validation_rows if row.validation_status == "FAIL")
         print(f"Wrote bond quote validation report to:     {bond_quote_validation_report_path}")
+        print(f"Wrote bond quote validation summary to:    {bond_quote_validation_summary_path}")
         print(f"Bond quote validations: {len(bond_quote_validation_rows)} total, {failed} failed")
     if treasury_result is not None:
         print_treasury_instrument_curve_report(treasury_result)
@@ -232,6 +296,7 @@ def main() -> None:
         logging.info("Wrote SOFR/OIS report: %s", sofr_ois_report_path)
     if bond_quote_validation_rows is not None:
         logging.info("Wrote bond quote validation report: %s", bond_quote_validation_report_path)
+        logging.info("Wrote bond quote validation summary: %s", bond_quote_validation_summary_path)
     logging.info("Workflow completed successfully.")
 
 

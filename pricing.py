@@ -263,9 +263,159 @@ def solve_ytm(market_price: float, face_value: float, coupon_rate: float, maturi
     def objective(yield_guess: float) -> float:
         theoretical_price = price_from_yield(face_value=face_value, coupon_rate=coupon_rate, maturity_years=maturity_years, yield_rate=yield_guess, frequency=frequency)
         return theoretical_price - market_price
-    return solve_with_expanding_bracket(objective, lower=-frequency + 1e-10, upper=0.25, max_abs_bound=10.0,
+    return solve_with_expanding_bracket(objective, lower=-0.99 * frequency, upper=0.25, max_abs_bound=10.0,
                                         failure_message="Could not bracket a yield-to-maturity solution.",
                                         expand_lower=False, expand_upper=True)
+
+
+def price_cashflows_from_yield(cashflows: list[tuple[float, float]], yield_rate: float,
+                               frequency: int = 2,
+                               compounding: CompoundingConvention | str = CompoundingConvention.COMPOUNDED) -> float:
+    """
+    Prices dated cashflows from a single flat yield.
+    """
+    validate_compounding_frequency(frequency)
+    validate_rate(yield_rate, "yield_rate")
+    present_value = 0.0
+    for payment_time, amount in cashflows:
+        if payment_time < 0 or not math.isfinite(payment_time):
+            raise ValueError("cashflow payment times must be non-negative and finite.")
+        if not math.isfinite(amount):
+            raise ValueError("cashflow amounts must be finite.")
+        present_value += amount * discount_factor_from_rate(rate=yield_rate, time_years=payment_time,
+                                                            compounding=compounding, compounding_frequency=frequency)
+    return present_value
+
+
+def solve_cashflow_yield(dirty_price: float, cashflows: list[tuple[float, float]],
+                         frequency: int = 2,
+                         compounding: CompoundingConvention | str = CompoundingConvention.COMPOUNDED) -> float:
+    """
+    Solves the flat yield that reproduces a dirty price for given cashflows.
+    """
+    _validate_positive(dirty_price, "dirty_price")
+    validate_compounding_frequency(frequency)
+
+    def objective(yield_guess: float) -> float:
+        return price_cashflows_from_yield(cashflows=cashflows, yield_rate=yield_guess,
+                                          frequency=frequency, compounding=compounding) - dirty_price
+
+    return solve_with_expanding_bracket(objective, lower=-0.99 * frequency, upper=0.25, max_abs_bound=10.0,
+                                        failure_message="Could not bracket an implied-yield solution.",
+                                        expand_lower=False, expand_upper=True)
+
+
+def price_cashflows_with_z_spread(cashflows: list[tuple[float, float]], curve: ZeroCurve, z_spread: float,
+                                  allow_curve_extrapolation: bool = True) -> float:
+    """
+    Prices cashflows after adding a constant spread to the zero curve.
+    """
+    validate_rate(z_spread, "z_spread")
+    return curve.bumped(z_spread).price_cashflows(cashflows, allow_extrapolation=allow_curve_extrapolation)
+
+
+def solve_z_spread(dirty_price: float, cashflows: list[tuple[float, float]], curve: ZeroCurve,
+                   allow_curve_extrapolation: bool = True) -> float:
+    """
+    Solves the constant spread over the zero curve that matches dirty price.
+    """
+    _validate_positive(dirty_price, "dirty_price")
+
+    def objective(spread_guess: float) -> float:
+        return price_cashflows_with_z_spread(cashflows=cashflows, curve=curve, z_spread=spread_guess,
+                                             allow_curve_extrapolation=allow_curve_extrapolation) - dirty_price
+
+    return solve_with_expanding_bracket(objective, failure_message="Could not bracket a z-spread solution.")
+
+
+def cashflow_curve_dv01(cashflows: list[tuple[float, float]], curve: ZeroCurve,
+                        bump_size: float = BASIS_POINT, allow_curve_extrapolation: bool = True) -> float:
+    """
+    Calculates parallel DV01 for generic cashflows discounted by a ZeroCurve.
+    """
+    return cashflow_curve_risk(cashflows=cashflows, curve=curve, bump_size=bump_size,
+                               allow_curve_extrapolation=allow_curve_extrapolation)["parallel_dv01"]
+
+
+def cashflow_curve_risk(cashflows: list[tuple[float, float]], curve: ZeroCurve,
+                        bump_size: float = BASIS_POINT, allow_curve_extrapolation: bool = True) -> dict[str, float]:
+    """
+    Calculates parallel DV01, effective duration, and effective convexity.
+
+    The measures use the same central-difference bump: all zero-rate nodes move
+    up and down by the configured bump size.
+    """
+    validate_rate(bump_size, "bump_size")
+    if bump_size <= 0:
+        raise ValueError("bump_size must be positive.")
+    base_dirty_price = curve.price_cashflows(cashflows, allow_extrapolation=allow_curve_extrapolation)
+    _validate_positive(base_dirty_price, "base_dirty_price")
+    price_down = curve.bumped(-bump_size).price_cashflows(cashflows, allow_extrapolation=allow_curve_extrapolation)
+    price_up = curve.bumped(bump_size).price_cashflows(cashflows, allow_extrapolation=allow_curve_extrapolation)
+    parallel_dv01 = (price_down - price_up) / 2
+    return {
+        "base_dirty_price": base_dirty_price,
+        "price_down_1bp": price_down,
+        "price_up_1bp": price_up,
+        "parallel_dv01": parallel_dv01,
+        "effective_duration": parallel_dv01 / (base_dirty_price * bump_size),
+        "effective_convexity": (price_down + price_up - 2 * base_dirty_price) / (base_dirty_price * bump_size ** 2),
+        "bump_size": bump_size,
+    }
+
+
+def cashflow_effective_duration(cashflows: list[tuple[float, float]], curve: ZeroCurve,
+                                bump_size: float = BASIS_POINT, allow_curve_extrapolation: bool = True) -> float:
+    """
+    Returns curve effective duration from a parallel zero-curve bump.
+    """
+    return cashflow_curve_risk(cashflows=cashflows, curve=curve, bump_size=bump_size,
+                               allow_curve_extrapolation=allow_curve_extrapolation)["effective_duration"]
+
+
+def cashflow_effective_convexity(cashflows: list[tuple[float, float]], curve: ZeroCurve,
+                                 bump_size: float = BASIS_POINT, allow_curve_extrapolation: bool = True) -> float:
+    """
+    Returns curve effective convexity from a parallel zero-curve bump.
+    """
+    return cashflow_curve_risk(cashflows=cashflows, curve=curve, bump_size=bump_size,
+                               allow_curve_extrapolation=allow_curve_extrapolation)["effective_convexity"]
+
+
+def fixed_coupon_bond_from_instrument(instrument: "InstrumentSpec", valuation_date: date) -> DateAwareFixedCouponBond:
+    """
+    Builds the date-aware fixed-coupon pricer from an InstrumentSpec.
+    """
+    if instrument.coupon_rate is None:
+        raise ValueError("coupon_rate is required for fixed_coupon_bond.")
+    return DateAwareFixedCouponBond(
+        face_value=instrument.face_value,
+        coupon_rate=instrument.coupon_rate,
+        issue_date=instrument.issue_date,
+        maturity_date=instrument.maturity_date,
+        settlement_date=valuation_date,
+        frequency=instrument.frequency,
+        day_count=instrument.day_count,
+        discount_day_count=instrument.discount_day_count,
+        business_day_convention=instrument.business_day_convention,
+        date_generation_rule=instrument.date_generation_rule,
+        end_of_month=instrument.end_of_month)
+
+
+def future_cashflows_from_instrument(instrument: "InstrumentSpec", valuation_date: date) -> list[tuple[float, float]]:
+    """
+    Returns future cashflows as (time_from_valuation, amount).
+    """
+    if instrument.instrument_type == "fixed_coupon_bond":
+        bond = fixed_coupon_bond_from_instrument(instrument=instrument, valuation_date=valuation_date)
+        return [(time_from_settlement, amount) for _, time_from_settlement, amount in bond.future_cashflow_schedule()]
+    if instrument.instrument_type == "zero_coupon_bond":
+        if not (instrument.issue_date <= valuation_date < instrument.maturity_date):
+            raise ValueError("valuation_date must be on or after issue_date and before maturity_date.")
+        time_to_maturity = year_fraction(start_date=valuation_date, end_date=instrument.maturity_date,
+                                         convention=instrument.discount_day_count)
+        return [(time_to_maturity, instrument.face_value)]
+    raise NotImplementedError(f"Unsupported instrument type: {instrument.instrument_type}, cashflows are not implemented yet")
 
 
 @dataclass(frozen=True)
@@ -389,9 +539,13 @@ def _price_fixed_coupon_bond(instrument: InstrumentSpec, market: MarketState, co
         date_generation_rule=instrument.date_generation_rule,
         end_of_month=instrument.end_of_month)
 
-    dirty_price = bond.dirty_price_from_curve(market.discount_curve)
+    cashflows = [(time_from_settlement, amount) for _, time_from_settlement, amount in bond.future_cashflow_schedule()]
+    base_dirty_price = market.discount_curve.price_cashflows(cashflows, allow_extrapolation=True)
+    z_spread = context.pricing.z_spread
+    dirty_price = price_cashflows_with_z_spread(cashflows=cashflows, curve=market.discount_curve, z_spread=z_spread) if z_spread else base_dirty_price
     accrued_interest = bond.accrued_interest()
     clean_price = dirty_price - accrued_interest
+    base_clean_price = base_dirty_price - accrued_interest
 
     return PricingResult(
         instrument_id=instrument.instrument_id,
@@ -403,7 +557,13 @@ def _price_fixed_coupon_bond(instrument: InstrumentSpec, market: MarketState, co
         diagnostics={"instrument_type": instrument.instrument_type,
             "price_type": context.pricing.price_type,
             "quote_source": market.quote_source,
-            "curve_date": market.curve_date.isoformat() if market.curve_date else None})
+            "curve_date": market.curve_date.isoformat() if market.curve_date else None,
+            "applied_z_spread": z_spread,
+            "applied_z_spread_bp": z_spread * 10000,
+            "z_spread_source": context.pricing.z_spread_source,
+            "base_dirty_price": base_dirty_price,
+            "base_clean_price": base_clean_price,
+            "spread_price_impact": dirty_price - base_dirty_price})
 
 
 def _price_zero_coupon_bond(instrument: InstrumentSpec, market: MarketState, context: PricingContext) -> PricingResult:
@@ -411,9 +571,13 @@ def _price_zero_coupon_bond(instrument: InstrumentSpec, market: MarketState, con
         raise ValueError("valuation_date must be on or after issue_date and before maturity_date.")
 
     time_to_maturity = year_fraction(start_date=market.valuation_date, end_date=instrument.maturity_date, convention=instrument.discount_day_count)
-    dirty_price = instrument.face_value * market.discount_curve.discount_factor(maturity=time_to_maturity, allow_extrapolation=True)
+    cashflows = [(time_to_maturity, instrument.face_value)]
+    base_dirty_price = market.discount_curve.price_cashflows(cashflows, allow_extrapolation=True)
+    z_spread = context.pricing.z_spread
+    dirty_price = price_cashflows_with_z_spread(cashflows=cashflows, curve=market.discount_curve, z_spread=z_spread) if z_spread else base_dirty_price
     accrued_interest = _zero_coupon_accrued_interest(instrument=instrument, market=market)
     clean_price = dirty_price - accrued_interest
+    base_clean_price = base_dirty_price - accrued_interest
 
     return PricingResult(
         instrument_id=instrument.instrument_id,
@@ -427,7 +591,13 @@ def _price_zero_coupon_bond(instrument: InstrumentSpec, market: MarketState, con
             "quote_source": market.quote_source,
             "curve_date": market.curve_date.isoformat() if market.curve_date else None,
             "time_to_maturity": time_to_maturity,
-            "accrual_method": "constant_yield_accretion" if instrument.issue_price is not None else "none"})
+            "accrual_method": "constant_yield_accretion" if instrument.issue_price is not None else "none",
+            "applied_z_spread": z_spread,
+            "applied_z_spread_bp": z_spread * 10000,
+            "z_spread_source": context.pricing.z_spread_source,
+            "base_dirty_price": base_dirty_price,
+            "base_clean_price": base_clean_price,
+            "spread_price_impact": dirty_price - base_dirty_price})
 
 
 def _zero_coupon_accrued_interest(instrument: InstrumentSpec, market: MarketState) -> float:

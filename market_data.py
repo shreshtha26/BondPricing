@@ -197,6 +197,12 @@ class BondMarketQuote:
     ask: float | None = None
     quote_type: str = "market_price"
     timestamp: datetime | None = None
+    stale_flag: bool = False
+    override_flag: bool = False
+    source_system: str | None = None
+    source_record_id: str | None = None
+    clean_price: float | None = None
+    dirty_price: float | None = None
 
     def __post_init__(self) -> None:
         if not self.security_id.strip():
@@ -210,10 +216,21 @@ class BondMarketQuote:
             raise ValueError("price_type must be 'clean' or 'dirty'.")
         if not self.quote_source.strip():
             raise ValueError("quote_source is required.")
-        for field_name, field_value in {"observed_price": self.observed_price, "bid": self.bid, "ask": self.ask}.items():
+        self.quote_source = self.quote_source.strip()
+        self.quote_type = self.quote_type.strip() or "market_price"
+        self.source_system = self.source_system.strip() if self.source_system else None
+        self.source_record_id = self.source_record_id.strip() if self.source_record_id else None
+        if self.observed_price is None:
+            self.observed_price = self.clean_price if self.price_type == "clean" else self.dirty_price
+        if self.clean_price is None and self.price_type == "clean":
+            self.clean_price = self.observed_price
+        if self.dirty_price is None and self.price_type == "dirty":
+            self.dirty_price = self.observed_price
+        for field_name, field_value in {"observed_price": self.observed_price, "bid": self.bid, "ask": self.ask,
+                                        "clean_price": self.clean_price, "dirty_price": self.dirty_price}.items():
             if field_value is not None and (not math.isfinite(field_value) or field_value <= 0):
                 raise ValueError(f"{field_name} must be positive and finite when provided.")
-        if self.observed_price is None and self.bid is None and self.ask is None:
+        if self.observed_price is None and self.bid is None and self.ask is None and self.clean_price is None and self.dirty_price is None:
             raise ValueError("At least one of observed_price, bid, or ask is required.")
         if self.bid is not None and self.ask is not None and self.bid > self.ask:
             raise ValueError("bid cannot be greater than ask.")
@@ -240,11 +257,50 @@ class BondMarketQuote:
             return None
         return self.bid <= model_price <= self.ask
 
+    @property
+    def is_evaluated(self) -> bool:
+        quote_type = self.quote_type.strip().lower()
+        return "eval" in quote_type or "matrix" in quote_type or "vendor" in quote_type
+
+    @property
+    def is_traded(self) -> bool:
+        quote_type = self.quote_type.strip().lower()
+        return "trade" in quote_type or "traded" in quote_type or "trace" in quote_type or "execution" in quote_type
+
+    def age_seconds(self, as_of: datetime) -> float | None:
+        if self.timestamp is None:
+            return None
+        timestamp = self.timestamp
+        comparison_time = as_of
+        if timestamp.tzinfo is not None and comparison_time.tzinfo is None:
+            comparison_time = comparison_time.replace(tzinfo=timestamp.tzinfo)
+        elif timestamp.tzinfo is None and comparison_time.tzinfo is not None:
+            comparison_time = comparison_time.replace(tzinfo=None)
+        return (comparison_time - timestamp).total_seconds()
+
+    def is_stale_as_of(self, as_of: datetime, max_age_seconds: float | None) -> bool:
+        if self.stale_flag:
+            return True
+        if max_age_seconds is None:
+            return False
+        if not math.isfinite(max_age_seconds) or max_age_seconds < 0:
+            raise ValueError("max_age_seconds must be non-negative and finite.")
+        age = self.age_seconds(as_of)
+        return age is not None and age > max_age_seconds
+
+    def clean_dirty_mismatch(self, accrued_interest: float, tolerance: float) -> bool:
+        if self.clean_price is None or self.dirty_price is None:
+            return False
+        expected_dirty = self.clean_price + accrued_interest
+        return abs(self.dirty_price - expected_dirty) > max(tolerance, 0.01)
+
     def row(self) -> dict[str, float | str | bool | None]:
         return {
             "security_id": self.security_id,
             "valuation_date": self.valuation_date.isoformat(),
             "observed_price": self.observed_price,
+            "clean_price": self.clean_price,
+            "dirty_price": self.dirty_price,
             "bid": self.bid,
             "ask": self.ask,
             "mid": self.mid,
@@ -253,6 +309,12 @@ class BondMarketQuote:
             "quote_source": self.quote_source,
             "quote_type": self.quote_type,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "stale_flag": self.stale_flag,
+            "override_flag": self.override_flag,
+            "source_system": self.source_system,
+            "source_record_id": self.source_record_id,
+            "is_evaluated": self.is_evaluated,
+            "is_traded": self.is_traded,
             "currency": self.currency,
         }
 
@@ -337,6 +399,12 @@ def load_bond_market_quotes_from_csv(path: str | Path) -> list[BondMarketQuote]:
                     quote_source=quote_source,
                     quote_type=row.get("quote_type", "market_price").strip() or "market_price",
                     timestamp=datetime.fromisoformat(timestamp_text) if timestamp_text else None,
+                    stale_flag=parse_optional_bool(row, "stale_flag"),
+                    override_flag=parse_optional_bool(row, "override_flag"),
+                    source_system=row.get("source_system", "").strip() or None,
+                    source_record_id=row.get("source_record_id", "").strip() or None,
+                    clean_price=clean_price,
+                    dirty_price=dirty_price,
                     currency=currency,
                 ))
             except Exception as error:
@@ -576,6 +644,118 @@ class TreasuryCurveSnapshot:
             "forward_start": forward_start, "forward_end": forward_end, "forward_rate": forward_rate}
             for (maturity, par_yield, zero_rate, discount_factor, (forward_start, forward_end, forward_rate))
             in zip(self.maturities, self.par_yields, zero_rates, discount_factors, forward_rates)]
+
+
+@dataclass(frozen=True)
+class CurveMetadata:
+    """
+    Compact audit header for the curve used in one valuation run.
+    """
+    curve_name: str
+    curve_source: str
+    curve_type: str
+    curve_date: Date | None
+    curve_build_method: str
+    curve_role: str
+    discount_curve_used: str
+    calibration_status: str = "NOT_RUN"
+    calibration_residual_bp: float | None = None
+    interpolation_method: str = "unknown"
+    extrapolation_method: str = "unknown"
+
+    def __post_init__(self) -> None:
+        for field_name, field_value in {
+            "curve_name": self.curve_name,
+            "curve_source": self.curve_source,
+            "curve_type": self.curve_type,
+            "curve_build_method": self.curve_build_method,
+            "curve_role": self.curve_role,
+            "discount_curve_used": self.discount_curve_used,
+            "calibration_status": self.calibration_status,
+        }.items():
+            if not field_value.strip():
+                raise ValueError(f"{field_name} is required.")
+        if self.calibration_residual_bp is not None and not math.isfinite(self.calibration_residual_bp):
+            raise ValueError("calibration_residual_bp must be finite when provided.")
+
+    @classmethod
+    def unknown(cls) -> "CurveMetadata":
+        return cls(
+            curve_name="UNKNOWN",
+            curve_source="UNKNOWN",
+            curve_type="UNKNOWN",
+            curve_date=None,
+            curve_build_method="UNKNOWN",
+            curve_role="UNKNOWN",
+            discount_curve_used="UNKNOWN",
+        )
+
+    @classmethod
+    def from_treasury_snapshot(cls, snapshot: TreasuryCurveSnapshot, calibration_status: str = "NOT_RUN",
+                               calibration_residual_bp: float | None = None) -> "CurveMetadata":
+        return cls(
+            curve_name="FRED Treasury CMT",
+            curve_source=snapshot.source,
+            curve_type="zero",
+            curve_date=snapshot.valuation_date,
+            curve_build_method=snapshot.curve_build_method,
+            curve_role="treasury_benchmark",
+            discount_curve_used="FRED Treasury CMT bootstrapped zero curve",
+            calibration_status=calibration_status,
+            calibration_residual_bp=calibration_residual_bp,
+            interpolation_method=snapshot.interpolation_method,
+            extrapolation_method=snapshot.extrapolation_method,
+        )
+
+    @classmethod
+    def from_treasury_instrument_result(cls, result, calibration_status: str = "BOOTSTRAPPED",
+                                        calibration_residual_bp: float | None = None) -> "CurveMetadata":
+        return cls(
+            curve_name="Treasury Instrument Zero Curve",
+            curve_source=result.source,
+            curve_type="zero",
+            curve_date=result.settlement_date,
+            curve_build_method=result.curve_build_method,
+            curve_role="treasury_benchmark",
+            discount_curve_used="Price-based Treasury instrument zero curve",
+            calibration_status=calibration_status,
+            calibration_residual_bp=calibration_residual_bp,
+            interpolation_method=result.interpolation_method,
+            extrapolation_method=result.extrapolation_method,
+        )
+
+    @classmethod
+    def from_sofr_ois_result(cls, result, calibration_status: str = "BOOTSTRAPPED",
+                             calibration_residual_bp: float | None = None) -> "CurveMetadata":
+        return cls(
+            curve_name="USD SOFR/OIS",
+            curve_source=result.source,
+            curve_type="zero",
+            curve_date=result.effective_date,
+            curve_build_method=result.curve_build_method,
+            curve_role="collateral_discount",
+            discount_curve_used="SOFR/OIS discount curve",
+            calibration_status=calibration_status,
+            calibration_residual_bp=calibration_residual_bp,
+            interpolation_method=result.interpolation_method,
+            extrapolation_method="flat endpoint only when explicitly enabled",
+        )
+
+    def row(self) -> dict[str, float | str | None]:
+        return {
+            "curve_name": self.curve_name,
+            "curve_source": self.curve_source,
+            "curve_type": self.curve_type,
+            "curve_date": self.curve_date.isoformat() if self.curve_date else None,
+            "curve_build_method": self.curve_build_method,
+            "curve_role": self.curve_role,
+            "discount_curve_used": self.discount_curve_used,
+            "calibration_status": self.calibration_status,
+            "calibration_residual_bp": self.calibration_residual_bp,
+            "interpolation_method": self.interpolation_method,
+            "extrapolation_method": self.extrapolation_method,
+        }
+
 
 def download_fred_series(series_id: str) -> pd.DataFrame:
     """

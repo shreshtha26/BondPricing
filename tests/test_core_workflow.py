@@ -5,8 +5,9 @@ from tempfile import TemporaryDirectory
 from pricing import DateAwareFixedCouponBond
 from backtesting.risk_backtest import run_bond_risk_backtest
 from analytics import CalibrationRow
-from market_data import CurveSpec
-from main import parse_date, parse_rate
+from config import PricingConfig
+from market_data import CurveMetadata, CurveSpec
+from main import parse_basis_points, parse_date, parse_rate, select_validation_curve
 from market_data import MarketDataPoint
 from market_data import TreasuryCurveSnapshot
 from market_data import BondMarketQuote, SecurityMasterRecord, load_bond_market_quotes_from_csv, load_security_master_from_csv
@@ -16,9 +17,10 @@ from analytics import explain_price_move
 from analytics import key_rate_dv01_rows
 from analytics import valuation_snapshot_from_bond_curve
 from analytics import calibration_report_rows, clean_dirty_accrued_reconciliation_rows
-from analytics import validate_bond_quote, validate_bond_quotes
+from analytics import bond_quote_validation_summary, validate_bond_quote, validate_bond_quotes
 from curves import ZeroCurve
-from pricing import InstrumentSpec, MarketState, PricingContext, PricingResult, price
+from pricing import (InstrumentSpec, MarketState, PricingContext, PricingResult, cashflow_curve_risk,
+                     cashflow_effective_convexity, cashflow_effective_duration, price)
 
 class CoreWorkflowTests(unittest.TestCase):
     def test_parse_date_accepts_iso_and_missing_values(self) -> None:
@@ -34,6 +36,10 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(parse_rate(0.0525), 0.0525)
         self.assertAlmostEqual(parse_rate(5.25), 0.0525)
 
+    def test_parse_basis_points_converts_to_decimal_spread(self) -> None:
+        self.assertEqual(parse_basis_points(None), 0.0)
+        self.assertAlmostEqual(parse_basis_points(75.0), 0.0075)
+
     def test_bootstrap_calibration_report_reprices_par_yields(self) -> None:
         snapshot = TreasuryCurveSnapshot(valuation_date=date(2026, 6, 25), maturities=[0.5, 1.0, 2.0, 3.0], par_yields=[0.04, 0.041, 0.043, 0.044])
         rows = calibration_report_rows(snapshot)
@@ -46,6 +52,18 @@ class CoreWorkflowTests(unittest.TestCase):
         rows = key_rate_dv01_rows(bond=bond, curve=curve)
         self.assertEqual(len(rows), len(curve.maturities))
         self.assertTrue(any(abs(row["key_rate_dv01"]) > 0 for row in rows))
+
+    def test_cashflow_curve_risk_reports_duration_and_convexity(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0], zero_rates=[0.04, 0.041, 0.042, 0.043])
+        cashflows = [(1.0, 4.0), (2.0, 4.0), (3.0, 104.0)]
+
+        risk = cashflow_curve_risk(cashflows=cashflows, curve=curve)
+
+        self.assertGreater(risk["parallel_dv01"], 0.0)
+        self.assertGreater(risk["effective_duration"], 0.0)
+        self.assertGreater(risk["effective_convexity"], 0.0)
+        self.assertAlmostEqual(cashflow_effective_duration(cashflows, curve), risk["effective_duration"])
+        self.assertAlmostEqual(cashflow_effective_convexity(cashflows, curve), risk["effective_convexity"])
 
     def test_clean_dirty_accrued_reconciliation_passes(self) -> None:
         bond = DateAwareFixedCouponBond(face_value=100, coupon_rate=0.045, issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), settlement_date=date(2026, 6, 25))
@@ -170,6 +188,20 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(result.clean_price + result.accrued_interest, result.dirty_price, places=10)
         self.assertEqual(result.diagnostics["instrument_type"], "fixed_coupon_bond")
 
+    def test_pricing_context_applies_constant_z_spread(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
+        instrument = InstrumentSpec(instrument_id="TEST_BOND", instrument_type="fixed_coupon_bond", face_value=100.0,
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), coupon_rate=0.045)
+        market = MarketState(valuation_date=date(2026, 6, 25), discount_curve=curve, quote_source="TEST")
+
+        base_result = price(instrument, market)
+        spread_result = price(instrument, market, context=PricingContext(pricing=PricingConfig(z_spread=0.0075, z_spread_source="TEST")))
+
+        self.assertLess(spread_result.dirty_price, base_result.dirty_price)
+        self.assertAlmostEqual(float(spread_result.diagnostics["applied_z_spread_bp"]), 75.0)
+        self.assertAlmostEqual(float(spread_result.diagnostics["base_dirty_price"]), base_result.dirty_price)
+        self.assertLess(float(spread_result.diagnostics["spread_price_impact"]), 0.0)
+
     def test_cusip_level_quote_validation_prices_fixed_and_zero_coupon_bonds(self) -> None:
         curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
         valuation_date = date(2026, 6, 25)
@@ -189,9 +221,139 @@ class CoreWorkflowTests(unittest.TestCase):
         rows = validate_bond_quotes(securities=[fixed_security, zero_security], quotes=[fixed_quote, zero_quote], curve=curve, tolerance=1e-10)
 
         self.assertEqual(fixed_row.validation_status, "PASS_TOLERANCE")
+        self.assertEqual(fixed_row.residual_explanation, "PASS_TOLERANCE")
+        self.assertAlmostEqual(fixed_row.yield_error_bp, 0.0, places=8)
+        self.assertAlmostEqual(fixed_row.z_spread_bp, 0.0, places=8)
+        self.assertGreater(fixed_row.parallel_dv01, 0.0)
+        self.assertGreater(fixed_row.effective_duration, 0.0)
+        self.assertGreater(fixed_row.effective_convexity, 0.0)
         self.assertEqual([row.validation_status for row in rows], ["PASS_TOLERANCE", "PASS_TOLERANCE"])
         self.assertEqual(rows[0].price_type, "clean")
         self.assertEqual(rows[1].price_type, "dirty")
+        self.assertAlmostEqual(rows[1].yield_error_bp, 0.0, places=8)
+        self.assertAlmostEqual(rows[1].z_spread_bp, 0.0, places=8)
+        self.assertEqual(rows[0].curve_name, "UNKNOWN")
+        self.assertTrue(all(row.effective_duration > 0 for row in rows))
+        self.assertTrue(all(row.effective_convexity > 0 for row in rows))
+
+    def test_quote_validation_carries_curve_metadata(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
+        valuation_date = date(2026, 6, 25)
+        security = SecurityMasterRecord(security_id="912TESTFIX", id_type="CUSIP", instrument_type="fixed_coupon_bond",
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), face_value=100.0, frequency=2, currency="USD", coupon_rate=0.045)
+        model = price(security.to_instrument_spec(), MarketState(valuation_date=valuation_date, discount_curve=curve, quote_source="TEST"))
+        quote = BondMarketQuote(security_id="912TESTFIX", valuation_date=valuation_date, observed_price=model.clean_price,
+            price_type="clean", quote_source="TEST", currency="USD")
+        metadata = CurveMetadata(curve_name="USD Treasury", curve_source="TEST", curve_type="zero", curve_date=valuation_date,
+            curve_build_method="test bootstrap", curve_role="treasury_benchmark", discount_curve_used="USD Treasury zero",
+            calibration_status="PASS_TOLERANCE", calibration_residual_bp=0.01)
+
+        row = validate_bond_quote(security=security, quote=quote, curve=curve, tolerance=1e-10, curve_metadata=metadata)
+
+        self.assertEqual(row.curve_name, "USD Treasury")
+        self.assertEqual(row.curve_source, "TEST")
+        self.assertEqual(row.curve_type, "zero")
+        self.assertEqual(row.curve_date, valuation_date)
+        self.assertEqual(row.curve_role, "treasury_benchmark")
+        self.assertEqual(row.discount_curve_used, "USD Treasury zero")
+        self.assertEqual(row.curve_calibration_status, "PASS_TOLERANCE")
+        self.assertAlmostEqual(row.curve_calibration_residual_bp or 0.0, 0.01)
+
+    def test_validation_curve_selection_requires_matching_curve_inputs(self) -> None:
+        curve = ZeroCurve(maturities=[1.0, 2.0], zero_rates=[0.04, 0.041])
+        metadata = CurveMetadata(curve_name="USD Treasury", curve_source="TEST", curve_type="zero", curve_date=date(2026, 6, 25),
+            curve_build_method="test bootstrap", curve_role="treasury_benchmark", discount_curve_used="USD Treasury zero")
+
+        selected_curve, selected_metadata = select_validation_curve("cmt", curve, metadata)
+
+        self.assertIs(selected_curve, curve)
+        self.assertIs(selected_metadata, metadata)
+        with self.assertRaises(ValueError):
+            select_validation_curve("treasury-instruments", curve, metadata)
+
+    def test_bond_quote_validation_reports_yield_spread_and_dv01_residuals(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
+        valuation_date = date(2026, 6, 25)
+        security = SecurityMasterRecord(security_id="912TESTFIX", id_type="CUSIP", instrument_type="fixed_coupon_bond",
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), face_value=100.0, frequency=2, currency="USD", coupon_rate=0.045)
+        model = price(security.to_instrument_spec(), MarketState(valuation_date=valuation_date, discount_curve=curve, quote_source="TEST"))
+        quote = BondMarketQuote(security_id="912TESTFIX", valuation_date=valuation_date, observed_price=model.clean_price - 1.0,
+            price_type="clean", quote_source="TEST", currency="USD")
+
+        row = validate_bond_quote(security=security, quote=quote, curve=curve, tolerance=0.02)
+
+        self.assertEqual(row.validation_status, "FAIL")
+        self.assertEqual(row.residual_explanation, "POSSIBLE_SPREAD_OR_CREDIT_EFFECT")
+        self.assertGreater(row.market_implied_yield, row.model_implied_yield)
+        self.assertLess(row.yield_error_bp, 0.0)
+        self.assertGreater(row.z_spread_bp, 0.0)
+        self.assertGreater(row.parallel_dv01, 0.0)
+        self.assertAlmostEqual(row.market_dirty_price, quote.effective_price() + row.accrued_interest)
+
+    def test_bond_quote_validation_reports_spread_pricing_and_data_quality(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
+        valuation_date = date(2026, 6, 25)
+        security = SecurityMasterRecord(security_id="912TESTFIX", id_type="CUSIP", instrument_type="fixed_coupon_bond",
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), face_value=100.0, frequency=2, currency="USD", coupon_rate=0.045)
+        base_model = price(security.to_instrument_spec(), MarketState(valuation_date=valuation_date, discount_curve=curve, quote_source="TEST"))
+        quote = BondMarketQuote(security_id="912TESTFIX", valuation_date=valuation_date, observed_price=base_model.clean_price,
+            clean_price=base_model.clean_price, dirty_price=base_model.clean_price + base_model.accrued_interest + 0.50,
+            price_type="clean", quote_source="TEST", quote_type="evaluated_price", timestamp=datetime(2026, 6, 20, 12, 0),
+            currency="USD")
+        context = PricingContext(pricing=PricingConfig(z_spread=0.0075, z_spread_source="TEST"))
+
+        row = validate_bond_quote(security=security, quote=quote, curve=curve, context=context, tolerance=0.02, max_quote_age_days=1.0)
+
+        self.assertAlmostEqual(row.pricing_z_spread_bp, 75.0)
+        self.assertLess(row.model_price, row.base_model_price)
+        self.assertLess(row.spread_price_impact, 0.0)
+        self.assertTrue(row.quote_stale)
+        self.assertTrue(row.quote_evaluated)
+        self.assertTrue(row.clean_dirty_mismatch)
+        self.assertIn("STALE_QUOTE", row.data_quality_flags)
+        self.assertIn("CLEAN_DIRTY_MISMATCH", row.data_quality_flags)
+        self.assertEqual(row.residual_explanation, "POSSIBLE_DATA_QUALITY_ISSUE")
+        self.assertEqual(row.convention_level, "DESK_APPROXIMATION")
+
+    def test_bond_quote_validation_summary_rolls_up_file_level_diagnostics(self) -> None:
+        curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])
+        valuation_date = date(2026, 6, 25)
+        metadata = CurveMetadata(curve_name="USD Treasury", curve_source="TEST", curve_type="zero", curve_date=valuation_date,
+            curve_build_method="test bootstrap", curve_role="treasury_benchmark", discount_curve_used="USD Treasury zero",
+            calibration_status="PASS_TOLERANCE", calibration_residual_bp=0.01)
+        pass_security = SecurityMasterRecord(security_id="PASSFIX", id_type="CUSIP", instrument_type="fixed_coupon_bond",
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), face_value=100.0, frequency=2, currency="USD", coupon_rate=0.045)
+        fail_security = SecurityMasterRecord(security_id="FAILFIX", id_type="CUSIP", instrument_type="fixed_coupon_bond",
+            issue_date=date(2024, 2, 15), maturity_date=date(2034, 2, 15), face_value=100.0, frequency=2, currency="USD", coupon_rate=0.045)
+        pass_model = price(pass_security.to_instrument_spec(), MarketState(valuation_date=valuation_date, discount_curve=curve, quote_source="TEST"))
+        fail_model = price(fail_security.to_instrument_spec(), MarketState(valuation_date=valuation_date, discount_curve=curve, quote_source="TEST"))
+        pass_quote = BondMarketQuote(security_id="PASSFIX", valuation_date=valuation_date, observed_price=pass_model.clean_price,
+            price_type="clean", quote_source="TEST", currency="USD")
+        fail_quote = BondMarketQuote(security_id="FAILFIX", valuation_date=valuation_date, observed_price=fail_model.clean_price - 1.0,
+            price_type="clean", quote_source="TEST", currency="USD")
+
+        rows = [
+            validate_bond_quote(security=pass_security, quote=pass_quote, curve=curve, tolerance=1e-10, curve_metadata=metadata),
+            validate_bond_quote(security=fail_security, quote=fail_quote, curve=curve, tolerance=0.02, curve_metadata=metadata),
+        ]
+        summary = bond_quote_validation_summary(rows)
+
+        self.assertEqual(summary.valuation_date, "2026-06-25")
+        self.assertEqual(summary.curve_name, "USD Treasury")
+        self.assertEqual(summary.curve_date, "2026-06-25")
+        self.assertEqual(summary.total_bonds, 2)
+        self.assertEqual(summary.passed, 1)
+        self.assertEqual(summary.failed, 1)
+        self.assertAlmostEqual(summary.pass_rate, 0.5)
+        self.assertEqual(summary.largest_residual_security_id, "FAILFIX")
+        self.assertEqual(summary.data_quality_issue_count, 0)
+        self.assertEqual(summary.spread_or_credit_issue_count, 1)
+        self.assertGreater(summary.max_abs_price_error, 0.0)
+        self.assertGreater(summary.max_abs_yield_error_bp, 0.0)
+        self.assertGreater(summary.max_abs_z_spread_bp, 0.0)
+        self.assertGreater(summary.max_effective_duration, 0.0)
+        self.assertGreater(summary.max_effective_convexity, 0.0)
+        self.assertGreater(summary.total_parallel_dv01, 0.0)
 
     def test_security_master_and_quote_csv_loaders_support_validation(self) -> None:
         curve = ZeroCurve(maturities=[0.1, 1.0, 3.0, 5.0, 10.0], zero_rates=[0.04, 0.041, 0.042, 0.043, 0.044])

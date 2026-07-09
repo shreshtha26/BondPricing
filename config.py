@@ -4,6 +4,7 @@ Only project-wide defaults live here. Bond terms and market quotes still come
 from input files at runtime.
 """
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,8 @@ class CurveConfig:
 @dataclass(frozen=True)
 class PricingConfig:
     price_type: str = "dirty"
+    z_spread: float = 0.0
+    z_spread_source: str = "none"
     use_accrual: bool = True
     use_credit: bool = False
     use_optionality: bool = False
@@ -39,6 +42,14 @@ class PricingConfig:
     use_inflation: bool = False
     use_liquidity_adjustment: bool = False
     use_market_data_governance: bool = True
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.z_spread):
+            raise ValueError("z_spread must be finite.")
+        if not self.price_type.strip():
+            raise ValueError("price_type is required.")
+        if not self.z_spread_source.strip():
+            raise ValueError("z_spread_source is required.")
 
 
 @dataclass(frozen=True)

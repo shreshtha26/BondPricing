@@ -71,6 +71,36 @@ poetry run python main.py \
 
 Those sample files are not hidden defaults. They are ordinary input files that exercise the same ingestion path used for real broker, vendor, TRACE-style, or internally prepared data.
 
+Choose the curve used for validation:
+
+```bash
+poetry run python main.py \
+  --date 2024-06-25 \
+  --security-master-csv examples/security_master_sample.csv \
+  --bond-quotes-csv examples/bond_quotes_sample.csv \
+  --validation-curve cmt
+```
+
+Available validation curves:
+
+```text
+cmt                  FRED Treasury CMT bootstrapped zero curve
+treasury-instruments Actual Treasury bill/note/bond price bootstrap, requires --treasury-instruments-csv
+sofr-ois             SOFR/OIS discount curve, requires --ois-quotes-csv
+```
+
+Apply an explicit constant spread while pricing the validation file:
+
+```bash
+poetry run python main.py \
+  --date 2024-06-25 \
+  --security-master-csv examples/security_master_sample.csv \
+  --bond-quotes-csv examples/bond_quotes_sample.csv \
+  --validation-z-spread-bp 75
+```
+
+With a supplied spread, the validation report shows both the base-curve model price and the spread-adjusted model price.
+
 ## Real Data Inputs
 
 For quote validation, provide both files:
@@ -82,6 +112,8 @@ poetry run python main.py \
 ```
 
 The engine does not create a default bond inside `main.py`. Bond terms and observed prices must come from files you supply.
+
+For real CUSIP/ISIN validation, the first source of truth is still a supplied file. TRACE, EMMA, Bloomberg-style exports, broker runs, and internal marks should be normalized into the security-master and quote CSV schemas. Direct licensed/live connectors are intentionally not hidden inside the workflow.
 
 Optional Treasury instrument bootstrapping:
 
@@ -101,10 +133,16 @@ If `--sofr-rate` is omitted, the workflow tries to load SOFR from FRED for `--so
 
 The sample validation run writes `outputs/bond_quote_validation_report.csv`. A passing run looks like this:
 
-| security_id | price_type | market_price | model_price | residual | accrued_interest | status |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| SAMPLEFIXED1 | clean | 100.10 | 100.1009 | 0.0009 | 1.5295 | PASS_TOLERANCE |
-| SAMPLEZERO1 | dirty | 85.73 | 85.7275 | -0.0025 | 4.7100 | PASS_TOLERANCE |
+| security_id | curve_name | curve_date | price_type | market_price | model_price | residual | yield_error_bp | z_spread_bp | duration | convexity | parallel_dv01 | explanation |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| SAMPLEFIXED1 | FRED Treasury CMT | 2024-06-25 | clean | 100.10 | 100.1009 | 0.0009 | -0.0135 | 0.0132 | 6.5172 | 47.1881 | 0.0662 | PASS_TOLERANCE |
+| SAMPLEZERO1 | FRED Treasury CMT | 2024-06-25 | dirty | 85.73 | 85.7275 | -0.0025 | 0.0845 | -0.0827 | 3.5589 | 12.6658 | 0.0305 | PASS_TOLERANCE |
+
+The same run also writes `outputs/bond_quote_validation_summary.csv`:
+
+| valuation_date | curve_name | total_bonds | passed | failed | pass_rate | max_abs_price_error | max_duration | max_convexity | total_parallel_dv01 | data_quality_issue_count | stale_quote_count | largest_residual_security_id |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2024-06-25 | FRED Treasury CMT | 2 | 2 | 0 | 1.00 | 0.0025 | 6.5172 | 47.1881 | 0.0967 | 0 | 0 | SAMPLEZERO1 |
 
 The residual is:
 
@@ -118,12 +156,23 @@ A positive residual means the model price is above the observed quote. A negativ
 
 The first version explains a residual through the fields it can observe directly:
 
+- `curve_name`, `curve_source`, `curve_date`, `curve_build_method`, `curve_role`, and `discount_curve_used` show which curve produced the model price.
+- `curve_calibration_status` and `curve_calibration_residual_bp` show whether that curve reproduced its own input market quotes.
 - `clean_price`, `dirty_price`, and `accrued_interest` show whether the difference is coming from quote convention or settlement accrual.
 - `price_type` shows whether the market quote was compared on a clean or dirty basis.
+- `base_model_price`, `pricing_z_spread_bp`, and `spread_price_impact` show whether an explicit spread was applied to the selected curve before pricing.
+- `market_implied_yield`, `model_implied_yield`, and `yield_error_bp` translate the price residual into flat-yield terms.
+- `z_spread` and `z_spread_bp` show the constant spread over the selected zero curve that would match the observed dirty price.
+- `parallel_dv01` shows the dirty-price sensitivity to a one basis point parallel curve move.
+- `effective_duration` and `effective_convexity` are central-difference curve risk measures from the same parallel zero-curve bump used for DV01.
 - `quote_source`, `bid`, `ask`, and `tolerance` show whether the quote is a point estimate, a range, or a tolerance-based validation.
+- `quote_type`, `quote_timestamp`, `quote_age_days`, `quote_stale`, `quote_evaluated`, `quote_traded`, `quote_override`, `clean_dirty_mismatch`, and `data_quality_flags` explain whether the market quote itself is clean enough to trust.
+- `convention_level` and `convention_warnings` state that this is desk-style convention handling, not audit-grade vendor settlement logic.
 - The curve report and calibration report show whether the selected Treasury curve is internally consistent with the bootstrapped zero curve.
 
 Large residuals are not automatically errors. They may come from curve choice, stale quotes, missing credit spread, liquidity premium, tax treatment, embedded optionality, or security terms that do not match the supplied CSV.
+
+If `--validation-z-spread-bp` is supplied and the spread-adjusted model price misses the observed quote, the residual label can be `APPLIED_SPREAD_PRICING_EFFECT`. That means the residual is coming from the explicit spread assumption, not from the base curve alone.
 
 ## Outputs
 
@@ -133,6 +182,7 @@ Generated files are written to `outputs/`:
 curve_report.csv
 calibration_report.csv
 bond_quote_validation_report.csv
+bond_quote_validation_summary.csv
 treasury_instrument_curve_report.csv
 sofr_ois_curve_report.csv
 run.log
@@ -170,9 +220,9 @@ SAMPLEZERO1,SAMPLE,Demo issuer,zero_coupon_bond,2023-01-15,2028-01-15,,100,2,USD
 Bond quotes:
 
 ```text
-security_id,valuation_date,clean_price,dirty_price,bid,ask,quote_source,price_type,currency
-SAMPLEFIXED1,2024-06-25,100.10,,,,SAMPLE_FILE,clean,USD
-SAMPLEZERO1,2024-06-25,,85.73,,,SAMPLE_FILE,dirty,USD
+security_id,valuation_date,clean_price,dirty_price,bid,ask,quote_source,price_type,quote_type,timestamp,stale_flag,override_flag,source_system,source_record_id,currency
+SAMPLEFIXED1,2024-06-25,100.10,,,,SAMPLE_FILE,clean,market_price,,,,,USD
+SAMPLEZERO1,2024-06-25,,85.73,,,SAMPLE_FILE,dirty,market_price,,,,,USD
 ```
 
 Treasury instrument quotes:
@@ -204,6 +254,8 @@ Rates can be supplied as decimals such as `0.045` or percentages such as `4.5`.
 - Fixed-coupon bonds use generated coupon schedules, accrued interest, clean price, and dirty price.
 - Zero-coupon bonds discount principal and, when `issue_price` is supplied, report simple constant-yield accretion as accrued interest.
 - The quote-validation report compares supplied observed clean/dirty prices with model clean/dirty prices.
+- The validation curve can be selected with `--validation-curve cmt`, `--validation-curve treasury-instruments`, or `--validation-curve sofr-ois`.
+- `--validation-z-spread-bp` applies a constant spread to the selected curve before model pricing.
 - Holiday calendars are compact rule-based US government securities/New York bank calendars, not vendor-certified calendars.
 
 ## Current Limits
@@ -215,14 +267,14 @@ The main gaps are:
 - No licensed CUSIP/ISIN terms feed is included.
 - TRACE, EMMA, Bloomberg, broker-run, and evaluated-price data must be supplied as files for now.
 - Callable, puttable, floating-rate, inflation-linked, credit-risky, option, swap, and securitized-product logic are planned layers, not the first completed workflow.
-- Data-quality diagnostics are basic: quote source, currency, bid/ask, tolerance, and model-vs-market residual.
+- Data-quality diagnostics flag timestamp gaps, stale quotes, evaluated/traded quote type, overrides, bid/ask availability, and suspicious clean/dirty mismatches.
 
 ## Roadmap
 
 The build order is deliberately layered:
 
 1. Fixed-coupon and zero-coupon bond quote validation.
-2. Yield, spread, Z-spread, and DV01 diagnostics.
+2. Yield, spread, Z-spread, duration, convexity, and DV01 diagnostics.
 3. Floating-rate note pricing.
 4. Inflation-linked bond pricing.
 5. Callable and puttable bond logic.
